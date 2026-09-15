@@ -35,6 +35,37 @@ from utils.checkpoints import CheckpointHandler
 from utils.confusionmeter import ConfusionMeter
 from utils.early_stopping import EarlyStoppingCriterion
 from utils.summary import prepare_img, roc_fig, confusion_matrix_fig
+ENABLE_TENSORBOARD = False
+
+if ENABLE_TENSORBOARD:
+    from tensorboardX import SummaryWriter
+
+
+class _NullSummaryWriter:
+    """No-op replacement for tensorboardX.SummaryWriter when TensorBoard is disabled."""
+    def add_graph(self, *args, **kwargs):
+        pass
+
+    def add_image(self, *args, **kwargs):
+        pass
+
+    def add_scalar(self, *args, **kwargs):
+        pass
+
+    def add_figure(self, *args, **kwargs):
+        pass
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
+from utils.checkpoints import CheckpointHandler
+from utils.confusionmeter import ConfusionMeter
+from utils.early_stopping import EarlyStoppingCriterion
+from utils.summary import prepare_img, roc_fig, confusion_matrix_fig
 
 """
 Class which implements network training, validation and testing as well as writing checkpoints, logs, summaries, and saving the final model.
@@ -61,7 +92,10 @@ class Trainer:
         self.logger = logger
         self.prefix = prefix
 
-        self.logger.info("Init summary writer")
+        if ENABLE_TENSORBOARD:
+            self.logger.info("Init summary writer")
+        else:
+            self.logger.info("TensorBoard summary writer disabled")
 
         if summary_dir is not None:
             run_name = prefix + "_" if prefix != "" else ""
@@ -72,9 +106,9 @@ class Trainer:
             summary_dir = os.path.join(summary_dir, run_name)
 
         self.n_summaries = n_summaries
-        self.writer = SummaryWriter(summary_dir)
+        self.writer = SummaryWriter(summary_dir) if ENABLE_TENSORBOARD else _NullSummaryWriter()
 
-        if input_shape is not None:
+        if ENABLE_TENSORBOARD and input_shape is not None:
             dummy_input = torch.rand(input_shape)
             self.logger.info("Writing graph to summary")
             self.writer.add_graph(self.model, dummy_input)
