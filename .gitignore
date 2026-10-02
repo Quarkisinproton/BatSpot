@@ -1,2 +1,10 @@
 venv/
 EXECUTABLE/
+Data/
+AGENTS.md
+BatSpot_FineTune_Kaggle.ipynb
+Claude_improvement_plan.md
+kaggle.ipynb
+kaggle2.ipynb
+kaggle3.ipynb
+.gitgnore
