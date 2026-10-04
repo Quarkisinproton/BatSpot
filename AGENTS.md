@@ -44,6 +44,8 @@ python EVALUATION/start_evaluation.py EVALUATION/config
 - `trainer.py` has dual imports: both `animal_spot.utils.*` (correct) and bare `utils.*` (legacy, will break if not run from the right directory). The `animal_spot/` package imports work everywhere; the bare `utils.*` imports only work when CWD is the repo root.
 - TensorBoard is disabled (`ENABLE_TENSORBOARD = False` in `trainer.py:38`). A `_NullSummaryWriter` no-op class replaces `SummaryWriter`. Do not re-enable without the user asking.
 - `torch` is NOT in `requirements.txt`. It must be installed separately with the correct index URL for your platform.
+- The checked-in `venv/` has **CPU-only torch** (`2.14.0+cpu`). The dev laptop has an RTX 4050 (6 GB): do training/experiments with a CUDA build (`pip install torch` from PyPI gives cu130) in a separate venv. A 16-thread CPU run pinned the laptop at ~100 °C and is ~75x slower (see §8.6).
+- `PREDICTION/config` ships `min_max_norm=false`, but the official BatSpot models **and** the models fine-tuned by `batspot-train.ipynb` were trained with min-max normalisation (the official `config_predict` files set `min_max_norm=true`). Predicting with `false` silently feeds a differently scaled input; set it to `true` for these models. The flag is not stored inside the `.pk`.
 - Audio files must follow strict naming: `CLASSNAME-LABELINFO_ID_YEAR_TAPENAME_STARTTIMEMS_ENDTIMEMS.wav`. The first `-` before `_` splits class name from label info.
 - Data split is hardcoded 70/15/15 (train/val/test) in `main.py:436`.
 - Learning rate is multiplied by batch size internally (`main.py:412`).
@@ -598,6 +600,8 @@ was broken, so cleanup was not possible):
 
 ### 6.3 Applied Fixes across Notebooks (`BatSpot_FineTune_Kaggle.ipynb` & `batspot-train.ipynb`)
 
+> **SUPERSEDED for `batspot-train.ipynb` by §8.** The learning-rate / patience / epoch values in this table were a workaround for a different root cause (input windowing and steps-per-epoch). `batspot-train.ipynb` now uses batch 32, `base_lr` 3e-4 (classifier) / 1e-4 (detector). Also note the "Waits 120 real epochs" wording below is wrong since the §2.12 fix: patience counts **raw** epochs, so `early_stopping_patience_epochs = 60` means 60 raw epochs. `BatSpot_FineTune_Kaggle.ipynb` still has the old values and the first-20 ms bug.
+
 | Setting / Component | Old Value | New Value | Reason |
 | :--- | :---: | :---: | :--- |
 | `CLS_CONFIG['base_lr']` | `1e-4` (or `2e-4`) | **`1e-2`** | Provides sufficient gradient magnitude for 5–6 steps/epoch to train the 8-class head |
@@ -612,4 +616,564 @@ was broken, so cleanup was not possible):
 ## 7. Corrections & Status Summary
 
 - Both `BatSpot_FineTune_Kaggle.ipynb` and `batspot-train.ipynb` are synchronized with the 4 critical training/loss/patience fixes.
-- Data leakage between detector training splits and classifier evaluation sets in the cascaded pipeline is resolved by using the shared species-stratified 70/15/15 split across all datasets.
+- Data leakage between detector training splits and classifier evaluation sets in the cascaded pipeline is resolved by using the shared species-stratified 70/15/15 split across all datasets. (This does **not** cover leakage between *recordings*: see §8.2 item 6.)
+- `batspot-train.ipynb` was overhauled on 2026-10-04 (§8). `BatSpot_FineTune_Kaggle.ipynb`, `batspot-train-in-kaggle.ipynb` and the other notebooks were **not** updated and still read only the first 20 ms of each clip.
+
+---
+
+## 8. Windowing fix & accuracy overhaul of `batspot-train.ipynb` (2026-10-04)
+
+Everything here was measured, not assumed: controlled GPU experiments (§8.5), then the **real
+notebook executed end to end** on an RTX 4050 (§8.6). Scope: **only `batspot-train.ipynb`** was changed.
+The previous Kaggle run's outputs were cleared (they describe the old code); the original, with those
+outputs, is `/home/gb/batspot_gpu_experiments/batspot-train.ORIGINAL_with_kaggle_outputs.ipynb`.
+
+### 8.1 Why — the three questions that triggered this
+
+1. *"Why does the classifier stop at ~90 epochs?"* → It stopped at epoch **84**: best val at epoch 24 + `early_stopping_patience_epochs=60` (raw epochs) = 84. Working as configured, **not a bug** — and not the problem: training loss was ~0.0004 from epoch ~30 (memorised), and raising patience only prolongs an over-fit state. (§6.3's "waits 120 real epochs" is wrong; see the note there.)
+2. *"Why are fine-tuned models less accurate than the official ones?"* → They are **not**; the comparison was invalid (§8.2 item 2).
+3. *"How do we raise accuracy of every model?"* → Fix the input windowing (the dominant cause), the optimiser regime, and the selection metric (§8.2–8.4).
+
+### 8.2 Diagnosis — symptom → root cause → proof
+
+1. **Only the first 20 ms of each clip was ever used (dominant bottleneck).**
+   - *Cause:* `CachedBatDataset` did `spec[:seq_len]`. `seq_len` = 20 ms (30 frames @192 kHz, 39 @250 kHz) but clips are **15 ms – 2.6 s, median 375 ms; 96 % are >100 ms** (clips are Raven-selection *bouts* of several pulses). The window was the same one every epoch and often not the call at all. 674 fixed inputs → memorisation (train loss 0.0004, val flat), no augmentation effect, val/test limited to whatever sat at t=0.
+   - *Official behaviour:* `PaddedSubsequenceSampler(random=augmentation)` crops a **random** 20 ms window when training (centre crop otherwise) and `StridedAudioDataset` slides a 20 ms window over the recording at prediction. Official training clips are short, tight calls, so this never mattered upstream; it matters here.
+   - *Proof:* same code/LR/batch, only the window choice changed → detector m09 test **0.841 → 0.931**, classifier **0.754 → 0.853** (§8.5).
+2. **"Official accuracy" in Cell 17 was noise recall, not accuracy.** `run_model_evaluation` kept only files whose class name is in the model's class list. Official detectors know `{noise,target}`, the official classifier 15 European codes; our files are species codes, so only the 186 `noise` files matched. "m03 = 0.984" = *says noise on 98 % of noise clips*. I reproduced 0.984 / 0.876 / 0.801 exactly with an independent re-implementation (confirms it). Zero-shot on the real task (call vs noise, same 145 test clips): official detectors **balanced accuracy 0.73–0.80**, AUC 0.84–0.88 (plain acc 0.63–0.70 is the wrong column: they over-predict `call` on this 81/19 split); fine-tuned bal. acc 0.89–0.92, AUC 0.93–0.97, i.e. fine-tuning gains **+0.09 to +0.19 balanced accuracy** (corrected in §8.10 after the §9 review). The official classifier has zero overlapping species and, as a noise detector, balanced accuracy 0.50 (AUC 0.49).
+3. **Too few optimiser steps, "fixed" with a destabilising LR.** Batch 128 / 674 clips = **6 steps/epoch**. The official run used batch 16 (≈42 steps/epoch, 150 epochs ≈ 6 k steps). §6's response — LR 1e-2 — is 100× the official 1e-4, and the logged run was unstable with it (val acc fell to 0.42 at epoch 38). The right lever is more steps: **batch 32** (22 steps/epoch). Measured: lr 3e-4 > 1e-3 ≈ 1e-4 (§8.5); 1e-2 is not needed.
+4. **Model selection / scheduler on plain accuracy.** The detector split is 117 call / 28 noise: "always call" scores 0.807, indistinguishable from learning. The m03 detector in the last Kaggle run was exactly that (test acc 0.8069 = 117/145, precision 0.40, recall 0.50) while `ReduceLROnPlateau` (watching the flat val accuracy) decayed LR to 1.2e-8 by epoch ~160. Selection, LR schedule and early stopping now use **balanced accuracy** (`SELECT_METRIC`), which scores a constant predictor 0.5. Val is 145 clips (1 clip = 0.7 pt); best-epoch-on-val is optimistic by several points (classifier val 0.8345 → test 0.7655).
+5. **The detector → classifier cascade does not help.** The classifier already has a `noise` class, so a hard detector gate can only add its own errors: classifier alone 0.853 vs gate 0.841 (9 detector×classifier seed pairs, m09; the gate loses all 9; re-derived from the stored probabilities by `/home/gb/batspot_gpu_experiments/cascade_pairs.py` — with a val-tuned threshold the gate is 0.828). In the final notebook run: alone 0.876; gate 0.855 / 0.876 / 0.835 (m03/m09/m11); soft combination 0.883 / 0.862 / 0.862 — within noise of "alone". The detector is still useful for what BatSpot is for (finding calls in long recordings with the sliding window); it is not an accuracy booster for pre-cut clips.
+6. **Recording leakage inflates every number.** Filenames carry the tape id. There are only **28 recordings**; *heti is a single recording* and 86 of the 106 *rhbe* clips come from one. The stratified clip-level split puts clips of the same recording in train and test (**145/145 test clips share a recording with train**). Held-out-recording check (`StratifiedGroupKFold`, 2 seeds): detector m09 **balanced accuracy 0.64–0.71** (AUC 0.81–0.86) — the "accuracy ≈ 0.88" first quoted here was plain accuracy on the 81/19 split and hides noise recall of 0.30–0.44; classifier overall accuracy 0.42–0.49 (heti vanishes from training), ≈ 0.65 on the species that can be judged (heti/rhbe excluded, n=80). Treat in-split scores as an upper bound on performance for new recordings.
+7. **Front-end differences vs the official code (made faithful, effect not isolated).** Old: numpy STFT, `scipy.ndimage.zoom` (cubic spline) on the *power* spectrum (rings negative → clipped to the −100 dB floor), channel 0 only. New (official): `torch.stft(center=False)`/√Σw², **nearest** interpolation of the cropped band, mean over channels, `kaiser_best` resampling, dB floor −100, **per-window min-max**. Verified `min_max_norm=true` in all official `config_train*` files, so min-max is correct (not the 0/1-dB scheme).
+
+### 8.3 What changed in `batspot-train.ipynb`
+
+| Cell | Change | Logic |
+| :--- | :--- | :--- |
+| 1 (md) | Describes the windowing | Reader must know the model sees 20 ms windows |
+| 2 config | New `WINDOW_MODE` (`'energy_crop'`/`'first'`), `WINDOW_STRIDE=3`, `TRAIN_TOP_FRAC=0.20`, `TEST_TOPK=5`, `SELECT_METRIC='balanced_accuracy'`, `SPLIT_BY_RECORDING=False`. Detector: batch 32, lr 1e-4, 100 ep (raised from 60 after the Kaggle run, §8.9), eval every epoch, LR-patience 12, ES-patience 30. Classifier: batch 32, **lr 3e-4**, 120 ep, LR-patience 15, ES-patience 40 (all in RAW epochs) | §8.2 items 1,3,4; values from the §8.5 sweeps |
+| 4 imports | + `balanced_accuracy_score` | selection metric |
+| 6 dataset | `BatDataset`/`CachedBatDataset` → **`WindowedBatDataset`** + `predict_proba()` + official front end. Caches the *full-clip* dB spectrogram once (`spec_cache/<hash>/`, cache version `v2`, memory-mapped), crops windows at read time | item 1, 7. Train: random window from the loudest 20 %; eval: top-5 non-overlapping loudest windows, softmax averaged per clip |
+| 7 data | Leakage check always printed; optional `SPLIT_BY_RECORDING` | item 6 |
+| 9 train | Validation = clip-level `predict_proba`; score/scheduler/early-stop on `SELECT_METRIC`; history keeps `val_acc` + `val_bal_acc`; prints steps/epoch | items 3, 4 |
+| 11, 13 | Build windowed train/val/test datasets from the config dicts | — |
+| 12 | `evaluate_model` uses windowed clip-level probs; adds balanced accuracy | consistent protocol |
+| 14 | Reports **classifier alone / hard gate / soft combine** per detector | item 5 |
+| 15 | Prints a note: exported models need `min_max_norm=true` at prediction | §Gotchas |
+| 17–19 | Official models scored **zero-shot on the test split** with the same windowed protocol (detectors as call-vs-noise; the no-overlap classifier as noise-vs-call); final table "official vs fine-tuned" | item 2 |
+
+Unchanged on purpose: 3-detector loop, shared 70/15/15 split (seed 42), unweighted loss + `WeightedRandomSampler`, the `shortcut` architecture port, AMP, DataParallel path, export format, `RUN_CLIP_EXTRACTION` guard, `USE_AUGMENTATION=False`.
+
+### 8.4 The logic behind the windowing design
+
+- **Why crop at all:** the encoder was pretrained on 20 ms inputs (`sequence_len=20`); 20 ms is the model's input size, so a clip must be reduced to 20 ms windows. The clip label is valid for any window that contains the vocalisation, so every epoch can show a *different* valid sample of each clip — a large, free augmentation (≈ #windows per clip), which is what a 674-clip dataset needs.
+- **Why the loudest windows, not uniform:** between pulses a bout contains silence. A uniform crop there is labelled "species X" but has no call → label noise. The score (mean over frames of the per-frame max dB) is a cheap pulse proxy; training samples uniformly from the top 20 % of windows (≥3). The same rule is applied to noise clips, so the model cannot cheat on "this clip was chosen because it is loud".
+- **Why top-k average at test time:** one window can still miss; averaging the softmax of the top-5 non-overlapping windows mirrors the official sliding-window-then-aggregate prediction and cuts variance. Detector m09 (single 25-epoch run, `results_topk/res_D2_crop_m09.json`): top-1 0.903, top-3 0.931, top-5 0.931, top-10 0.931 → 5 is enough *(n=1: weak evidence, `TEST_TOPK=5` was never swept over seeds)*.
+- **Why per-window min-max:** official models are `min_max_norm=true` and `predict.py` normalises each 20 ms window separately; training windows are normalised the same way so train/val/test/prediction see one distribution.
+- **Why batch 32 / lr 3e-4 and not 1e-2:** the real deficit was optimiser steps (6 vs ~42 per epoch), so fix steps, keep the LR near the official 1e-4 (3e-4 won the sweep).
+- **Why balanced accuracy:** it is mean per-class recall, so predicting the majority class scores 0.5 instead of 0.81.
+- **Pretraining matters little here:** from-scratch encoders scored 0.931 (detector m09) and 0.841 (classifier) vs 0.933 / 0.853 pretrained (1 seed each). Keep fine-tuning (free, never worse in these runs), but do not expect the official weights to be the accuracy lever — more recordings are.
+
+### 8.5 Controlled experiments (GPU, split seed 42, test n=145, mean over seeds; SE ≈ ±3 pt)
+
+| Task | Input | Result (test acc) |
+| :--- | :--- | :--- |
+| Classifier | first 20 ms, lr 1e-4 / 1e-3, 60 ep (n=3) | 0.754 / 0.745 |
+| Classifier | energy-crop + top-5, lr 1e-4 / **3e-4** / 1e-3, 60 ep (n=3) | 0.825 / **0.853** / 0.828 |
+| Classifier | energy-crop, lr 3e-4, 120 ep (n=1) | 0.862 (best epoch still ~60) |
+| Classifier | energy-crop, lr 3e-4, scratch encoder (n=1) | 0.841 |
+| Detector m09 | first 20 ms (n=2) → energy-crop (n=3) | 0.866 → **0.933** |
+| Detector m11 | first 20 ms (n=2) → energy-crop (n=3) | 0.848 → **0.908** |
+| Detector m03 | first 20 ms (n=2) → energy-crop (n=3) | 0.876 → 0.869 (best epoch 2–4: weakest pretrain, over-fits fast) |
+| Detector m09 | energy-crop, scratch (n=1) | 0.931 |
+| Zero-shot official detectors | old input, first 20 ms | AUC 0.76–0.79; sliding-window max aggregation: acc 0.855–0.873 on all 964 clips |
+| Recording-held-out | detector m09 first vs crop (n=2) | acc 0.880 vs 0.880 (AUC 0.791 vs 0.835) |
+
+### 8.6 End-to-end verification of the actual notebook (single seed, RTX 4050, 396 s total)
+
+Run with `/home/gb/batspot_gpu_experiments/run_notebook_locally.py` (executes every code cell, only Kaggle paths swapped; log: `notebook_local_run_2026-10-04.log`). All 19 cells ran without error, including the clip-extraction guard and the evaluation of the 14 local model files in `Data/model_output`.
+
+| | Before (last Kaggle run) | After |
+| :--- | :---: | :---: |
+| Classifier test acc / macro-F1 | 0.7655 / 0.7749 | **0.8759 / 0.8779** (early-stopped at 113; best epoch 73) |
+| Detector m03 test acc (bal. acc) | 0.8069 (all-call collapse) | **0.8759 (0.869)** |
+| Detector m09 | 0.8483 | **0.9241 (0.899)** |
+| Detector m11 | 0.8552 | **0.9103 (0.890)** |
+| Cascade, classifier alone / hard gate / soft (m09) | — / 0.7379 / — | 0.876 / 0.876 / 0.862 |
+
+Hardware note: the checked-in `venv/` is CPU-only. A first attempt on 16 CPU threads took ~35 min/run and drove the laptop to ~100 °C; on the GPU a 30-epoch run is ~40 s and the GPU stays ≤69 °C. Create a CUDA venv (`pip install torch` gives cu130) instead of reusing `venv/`.
+
+### 8.7 Known limits — read before trusting the numbers
+
+- **Kaggle verification done** (§8.9, 2×T4 with `DataParallel`, batch 16/GPU): same conclusions as the local run, no errors.
+- **Single test split of 145 clips** → ±3 pt noise; differences <3 pt (e.g. cascade variants, m03 vs scratch) are not meaningful. Multi-seed numbers are in §8.5; the notebook run is one seed.
+- **Recording leakage (§8.2 item 6) is not fixed**, only reported. The honest fix is more recordings per species (heti = 1, rhbe ≈ 2) and reporting a `SPLIT_BY_RECORDING=True` score.
+- **Untested options:** `USE_AUGMENTATION=True` on the windowed dataset; `WINDOW_MODE='first'` is kept only as an ablation switch.
+- **Exported `.pk` files do not record the normalisation mode**; set `min_max_norm=true` when predicting (§Gotchas; `PREDICTION/config` defaults to `false`).
+- **Other notebooks** (`BatSpot_FineTune_Kaggle.ipynb`, `batspot-train-in-kaggle.ipynb`, …) still have the first-20 ms bug and the old LR/patience values.
+- **Energy window selector is a heuristic.** It assumes the loudest part of a clip is the call; a loud non-bat transient in a call clip could be picked. Top-k averaging limits the damage.
+
+### 8.8 Where everything is
+
+`/home/gb/batspot_gpu_experiments/` (outside the repo): `gpuexp.py` (controlled-experiment engine), `sweep1.py`/`sweep2.py`, `zeroshot.py`, `results/*.json` (per-run metrics + test probabilities), `run_notebook_locally.py`, `apply_notebook_patch.py` + `new_notebook_cells/` (exact source of each replaced cell), `README.txt`.
+
+### 8.9 Kaggle run of the overhauled notebook (2026-10-04, 2×Tesla T4, torch 2.10.0+cu128, DataParallel)
+
+Source in the executed notebook is byte-identical to the delivered `batspot-train.ipynb`. All 18 code cells ran, 14.9 min total (dataset caching 127 s, detectors 399 s, classifier 339 s), **no stderr output at all** (the `Exception ignored ... can only test a child process` teardown spew of §3.5 did not appear in this run; that does not prove it is fixed). Test split = 145 clips, single seed.
+
+| | Before (old Kaggle run) | After (this run) | Local RTX 4050 run (§8.6) |
+| :--- | :---: | :---: | :---: |
+| Classifier test acc / bal. acc | 0.7655 / — | **0.8552 / 0.8585** (macro-F1 0.858) | 0.8759 |
+| Detector m03 acc (bal. acc, AUC) | 0.8069 (collapsed) | **0.8828 (0.887, 0.933)** | 0.8759 |
+| Detector m09 | 0.8483 | **0.9103 (0.917, 0.971)** | 0.9241 |
+| Detector m11 | 0.8552 | **0.8966 (0.909, 0.966)** | 0.9103 |
+| Official detectors zero-shot m03 / m09 / m11 (acc, AUC) | same cell mis-reported noise recall | 0.697, 0.883 / 0.628, 0.836 / 0.676, 0.857 | identical to 4 decimals |
+| Cascade (classifier alone / hard gate / soft), m03·m09·m11 | 0.7655 vs 0.7655 / 0.7379 / 0.7310 | 0.855 / 0.855·0.821·0.855 / 0.841·0.841·0.835 | — |
+
+Findings (each from the logged output):
+- **The fix transfers**: every model improved 4–9 pt and Kaggle lands inside the local multi-seed ranges (§8.5), i.e. run-to-run spread is ~±2 pt. m03 no longer collapses (balanced-accuracy selection works).
+- **Classifier stopped at epoch 99 = best epoch 59 + patience 40**, as configured. Train loss ends at ~0.33 (it was 0.0004): the model no longer memorises; val plateaus at 0.83–0.84 accuracy from epoch ~30, so more epochs will not help. LR was halved at ~epoch 45, 79, 91.
+- **Remaining classifier errors are concentrated** (21 of 145): `acsh` is the sink (10 of the 21 errors are predictions of acsh: alte→acsh 4, rhro→acsh 4, rhle→acsh 1, noise→acsh 1); `rhro` recall 8/14 and `rhle` 9/12; `alte`→`acsh` 4/27. **heti (10/10), rhbe (16/16) and sasa (14/14) are perfect, and these are the classes with the fewest recordings** (§8.2 item 6) — consistent with recording leakage, not proof of it.
+- **Detector m09 hit the `n_epochs=60` cap** with its best epoch at 58 (balanced accuracy 0.930; the last-10-epoch *mean* was 0.889, so "still rising" compared a max with a mean — the cap raise is harmless but the gain is ≈ noise, see §8.10): **done:** `DET_CONFIG['n_epochs']` is now 100 in Cell 2 (ES patience 30 still stops the other variants early). Verified by a full local re-run (completed, 0 errors): the log shows `Epoch N/100`; m09 ran past the old cap and early-stopped at epoch 81 (test 0.931), m03 at 57, m11 at 47. m03 stopped at 58 (best 28), m11 at 53 (best 23).
+- **Detectors lean towards "noise" at 0.5**: noise precision 0.64–0.70 with recall 0.89–0.93, call precision 0.97–0.98 with recall 0.88–0.91. The sampler shows noise 50 % of the time but it is 19 % of the data; the val-tuned gate thresholds (0.30 / 0.40 / **0.10**, the grid edge for m11) say the same. For use on real recordings, where noise windows vastly outnumber calls, the operating threshold must be chosen on full-length recordings with the sliding window — **nothing in this repo has evaluated that yet**.
+- **The cascade still does not help** (m09 gate −3.5 pt: rhro recall falls 0.57 → 0.29). Use the classifier alone on pre-cut clips; keep the detector for scanning long recordings.
+- **Kaggle was ~2.3× slower than the local RTX 4050** (14.9 vs 6.6 min), probably DataParallel on 16-clip per-GPU batches plus 4 CPU workers; not measured further.
+
+Extra checks run after the Kaggle result (local GPU, saved predictions; same split, SE ±3 pt), so that "more accuracy" advice is evidence-based:
+
+| Idea | Result | Verdict |
+| :--- | :--- | :--- |
+| Average 3 classifier seeds | 0.869 vs singles 0.841 / 0.855 / 0.862 | +≈1.5 pt, within noise |
+| Average 3 seeds or 3 mics (detector) | 0.924–0.931 vs singles 0.931–0.938 (m09) | no gain |
+| Longer input window: 40 ms (78 frames) | 0.862 / 0.841 (mean 0.852) vs 0.853 for 20 ms | no gain, 2× slower |
+| Longer input window: 60 ms (117 frames), 1 seed | 0.821 | worse (GPU memory pressure too) |
+
+Recommended next steps, in order: (1) ~~`DET_CONFIG['n_epochs']` 60 → 100~~ (done, Cell 2); (2) choose the detector threshold and judge false alarms on full-length recordings; (3) more recordings / label review for `rhro`, `rhle`, `acsh`↔`alte`, and report a recording-grouped score (`SPLIT_BY_RECORDING=True`) next to the in-split one; (4) report mean ± sd over several seeds rather than one split. Not worth doing: LR 1e-2, longer windows, ensembles for the detector, the detector→classifier gate. Window-length results: `/home/gb/batspot_gpu_experiments/results_window_length/`.
+
+### 8.10 Fixes taken from the §9 review, and what the evidence says (2026-10-04)
+
+I (Claude) checked every §9 claim against the notebook code and the saved artefacts before acting. **Confirmed and fixed in `batspot-train.ipynb`** (backup of the pre-fix notebook: `/home/gb/batspot_gpu_experiments/batspot-train.before_review_fixes.ipynb`):
+
+| Cell | Fix | Why / proof |
+| :--- | :--- | :--- |
+| 2 | `assert SELECT_METRIC in ('balanced_accuracy','accuracy')` | B3: a typo used to fall back to plain accuracy silently while the log still printed the typo'd name |
+| 6 | `_window`: **min-max first, then pad** (official order) | B2: padding a dB array with 0.0 first makes the padding the maximum — reproduced: padded region 1.0, real signal squashed to 0.70; now 0.0 / 1.0. Affects exactly **1 of 964** local clips (`sasa-bat_6431090_2026_20260525-192000_96139_96154`, 15 ms: 22 frames vs the 30 needed at 192 kHz, 29 vs 39 at 250 kHz), so negligible for the reported numbers — but reachable, and likelier on other data (§9's "0 of 964" and my own first note "unreachable here" were both wrong; counted from the cached spectrograms) |
+| 6 | `train_window_starts`: keep exactly `ceil(top_frac·n)` windows **by rank** (stable sort), not a percentile threshold | Ties kept *every* window: on the real cache median kept-fraction 0.202 but max 1.000 and 3 clips ≥ 90 % (uniform crop incl. silence = label noise). Unit test: 100 tied windows → 20 kept |
+| 7 | `recording_id` searches the Raven timestamp `\d{8}-\d{6}` instead of taking field 4; warns when every clip is its own recording | B4: identical 28-group partition on this data (verified); fragile positional parse no longer silently wrong on other file layouts. Note Cell 8's extractor, on this repo's selection naming (`acsh_devon_<date>_<time>.txt`), writes names with **no** Raven timestamp, so the new warning fires there instead of a silent false all-clear |
+| 9 | `train_model`: best weights are **always** snapshotted/restored (was gated on `save_path`); `best_score` starts at `-inf`; `.detach().clone()`; selection via dict lookup | B1: with `save_path=None` (the signature default) the last-epoch weights were returned with the best score reported. Unit test with a stubbed validator: returned weights = best validation (3.0) |
+| 18 | Summary table has `n` and `Note` columns, flags `NO SIGNAL (AUC~0.5)`, and prints the balanced-accuracy gain official → fine-tuned | B5: the official classifier was shown as 0.8069 "accuracy" = 117/145 = answering `call` for everything |
+
+**Verification:** unit tests of each fix on tiny inputs, then the **whole notebook re-run on the GPU** (`run_notebook_locally.py`, 431 s, 0 errors; log `notebook_local_run_2026-10-04_review_fixes.log`; the leakage check still prints 145/145, no recording warning).
+
+**Corrections to what I wrote earlier in §8** (already edited in place above): official detectors' headline figure is balanced accuracy 0.73–0.80, not acc 0.63–0.70 (gain from fine-tuning +0.09…+0.19, now printed by Cell 18: +0.088 / +0.167 / +0.167); held-out-recording detector balanced accuracy is 0.64–0.71, not "≈ 0.88"; the m09 "still rising" claim compared a max with a mean. §9 also asserted that the "9 seed pairs" and the top-k ablation had no artefact: both exist and reproduce, but one lived only in scratch space — now saved as `cascade_pairs.py` and `results_topk/`. `TEST_TOPK=5` rests on a single run.
+
+**Results of the re-run (single seed each; compare with §8.9):**
+
+| Test accuracy | Kaggle (§8.9) | Local, after `n_epochs=100` | Local, after review fixes |
+| :--- | :---: | :---: | :---: |
+| Classifier | 0.8552 | 0.8759 | 0.8483 (ran all 120 epochs, best epoch 92, never early-stopped) |
+| Detector m03 | 0.8828 | 0.8828 | 0.8828 (bal 0.887) |
+| Detector m09 | 0.9103 | 0.9310 | 0.8759 (bal 0.896) |
+| Detector m11 | 0.8966 | 0.8759 | 0.9241 (bal 0.926) |
+| Cascade: classifier alone / hard gate / soft (m03·m09·m11) | 0.855 / 0.855·0.821·0.855 / … | — | 0.848 / 0.835·0.766·0.828 / 0.828·0.841·0.869 |
+
+**Read these numbers honestly.** The fixes are latent on this dataset, so none is *expected* to move accuracy; the differences above are run-to-run noise (the training loop is not seeded). Note the **spread is larger than "±2 pt"**: m09 ranges 0.876–0.931 and m11 0.876–0.924 over three identical-config runs (≈ 5 pt), the classifier 0.848–0.876 (≈ 3 pt). So no single-run difference below ≈ 5 pt (detectors) / 3 pt (classifier) means anything, and the ranking of m03/m09/m11 is not established. The conclusions that survive: all three detectors beat the official zero-shot models by ≥ 0.09 balanced accuracy (AUC 0.93–0.97 vs 0.84–0.88); the classifier alone ≥ the hard-gated cascade in all three runs so far; the soft combination's 0.869 for m11 is +3 clips and not significant. The official-model rows are deterministic and identical to the previous run.
+
+**Not applied** (available in the §9 notebook `batspot_train(claude_bug_fixes _by__SPACE_BUNNY_MODEL).ipynb`, which has still **not** been run end to end): the prior-corrected detector gate, the recording-grouped retrain cell, the augmentation / multi-seed cell (the obvious cure for the spread above), and the cache-hardening changes. Recommended next: add a multi-seed (mean ± sd) report and a recording-grouped score, since every claim above is limited by single-split noise and by the 28-recording leakage (§8.2 item 6).
+
+---
+
+## 9. Independent review + fixes — Space Bunny Free (2026-10-04)
+
+**Author of this section: Space Bunny Free** (model ID `space-bunny-free`, provider `opencode`).
+This is an *independent second review* of §8, not a continuation of it. §8 was written by
+Claude; §9 is my own reading of the code, my own experiments, and my disagreements with it.
+
+**Deliverable:** `batspot_train(claude_bug_fixes _by__SPACE_BUNNY_MODEL).ipynb` (22 cells; 11 of the
+19 base code cells byte-identical, 7 rewritten, 2 appended). Base notebook untouched.
+**Test evidence:** `/home/gb/batspot_gpu_experiments/spacebunny_tests/`.
+
+- **6 suites, 107 assertions, 0 failures** — `test_fixes.py` (27), `test_dataset.py` (21),
+  `test_b5_labels.py` (18), `test_metric_guard.py` (16), `test_cell7.py` (14), `test_bug1.py` (11).
+  Every suite `exec`s the corresponding cells **extracted from the delivered `.ipynb`**, not a copy,
+  so the tests exercise the artefact rather than the source I edited.
+- **`redgreen.py` — red-green harness, 8/8.** For each fix it undoes that one fix in a scratch copy
+  and asserts the matching suite then FAILS. This is what makes the other number mean something;
+  see §9.8.
+
+Reproduce:
+```
+cd /home/gb/batspot_gpu_experiments/spacebunny_tests
+for t in test_*.py; do <repo>/venv/bin/python "$t"; done     # each prints PASS/FAIL per check
+<python> redgreen.py                                          # each fix reverted -> suite must fail
+```
+Suites read cells from `/tmp/opencode/verify` by default; override with `NEW_CELLS=<dir>` (this is
+how `redgreen.py` points them at a mutated copy). CPU, seconds.
+
+### 9.1 What I verified as CORRECT (so §9 is not read as blanket criticism)
+
+§8 is good work and most of it survives scrutiny. I confirmed these myself:
+
+- **The front end is bit-exact** against the vendored official code — `max|new − official| = 0.000e+00`
+  for both the 192 kHz detector and the 250 kHz classifier front ends, over real clips. Step for
+  step: `1/sqrt(Σw²)` normalisation, `center=False`, periodic Hann, floor/ceil bin cropping,
+  `nearest` band interpolation, the −100 dB floor, channel-mean, `kaiser_best`, pre-emphasis 0.98,
+  and per-window min-max. The old `scipy.ndimage.zoom` negative-ringing artefact is genuinely gone
+  (global min dB is exactly −100.0 over all 964 cached spectrograms, 0 NaN files).
+- **The official-vs-fine-tuned diagnosis is right.** m03's old "0.9839" was noise recall; I
+  reproduced 0.9839 / 0.8763 / 0.8011 independently and confirmed `target` support was 0.
+- **Class-index mapping is name-based, not assumed** — `probs[:, model_classes['target']]`. This
+  matters: the official classifier's `noise` sits at index **8** of 15, so a hard-coded `[:, 1]`
+  would have been silently wrong.
+- **Early stopping now counts raw epochs**, and simulating the loop from the config reproduces the
+  classifier's reported stop at epoch 113 exactly.
+- **`best_state` DataParallel handling is correct** (`best_state=None` initialised pre-loop,
+  `module.` prefix stripped on both save and restore).
+- **No double-weighting**: `CrossEntropyLoss()` unweighted *plus* `WeightedRandomSampler`, and
+  `compute_class_weights` is correctly sized from `num_classes`.
+- **No test leakage**: `det_test`/`cls_test` are built from `test_wavs` and first touched by
+  `evaluate_model` after `train_model` returns.
+- **The documentation is unusually honest** — `save_path` being dead (still true, §3 item 4), the
+  energy-window heuristic being unvalidated, recording leakage being reported-but-not-fixed. §8.7
+  lists its own limits. That is rarer than it should be and it is why the real bugs below were
+  findable at all.
+- **Almost every number in §8.5/§8.6 traces to an artefact.** I recomputed all 41
+  `results/*.json` aggregates; every mean and every `n=` matches. `run_notebook_locally.py` patches
+  only `!pip` lines and `/kaggle/` strings — it does not skip or alter any cell. The pre-change
+  notebook is genuinely preserved with 1986 saved outputs.
+
+### 9.2 Five real bugs — symptom → root cause → proof → fix
+
+All five are **latent**: none is corrupting the numbers in §8.6/§8.9. They are traps for the next
+person who edits this notebook.
+
+#### B1 — a plot filename decided which weights `train_model` returned
+
+- **Symptom.** `save_path` gated *both* the best-weights snapshot and its restore:
+  `if save_path:` before the snapshot, `if save_path and best_state is not None:` before the
+  restore. `save_path=None` is the documented default of the signature.
+- **Root cause.** §3 item 4 recorded that `save_path` "is dead" — used only as a truthiness gate.
+  It was worse than dead: it was load-bearing.
+- **Proof (executed, `test_bug1.py`).** Tiny synthetic problem whose validation score rises then
+  falls, so best ≠ last epoch. Re-scoring whatever `train_model` handed back:
+
+  | | reported best | re-scored | |
+  |---|---:|---:|---|
+  | base, `save_path=None` | 0.3690 | **0.3214** | last-epoch weights, best score reported |
+  | base, `save_path=set` | 0.3690 | 0.3690 | correct |
+  | fixed, `save_path=None` | 0.3690 | **0.3690** | correct |
+  | fixed, `save_path=set` | 0.3690 | 0.3690 | correct |
+
+- **Fix.** Gates removed; restore is unconditional. Also `best_score = -inf` (was `0.0`, so a first
+  validation scoring exactly 0.0 would never be captured), `.detach().clone()`, and `save_path` now
+  actually writes the training curves (`fig.savefig`) — `grep savefig` found nothing in §8's
+  notebook, so the `*_curves.png` names were fiction.
+
+#### B2 — silence was handed to the model as the loudest thing in the window
+
+- **Symptom.** `_window` did `minmax_normalize(pad_window(win, seq_len))`: pad **first**, normalise
+  second. A literal `0.0` inserted into a **dB** array is normally the array *maximum*, so min-max
+  divides by the padding and maps every padded row to **1.0**.
+- **Root cause.** The official order is normalise → pad (`animal_spot/data/audiodataset.py:622-629`,
+  `t_norm` then `t_subseq`), which leaves the pad region at 0.0.
+- **Proof (`test_fixes.py`, `test_dataset.py`).** On a sub-window clip inside a 20 ms window:
+
+  | | padded region | real signal max |
+  |---|---:|---:|
+  | base | **1.0000** | 0.4192 (squashed) |
+  | fixed | **0.0000** | 1.0000 |
+
+- **Reachability, stated honestly.** 0 of 964 local clips are shorter than one window (min 45
+  frames vs `seq_len` 30/39). But §8.2 item 1 states clips run "15 ms – 2.6 s", and the minimum
+  local duration *is* 15 ms, so the path is reachable on other data — and the code had no guard.
+- **Fix.** `win = minmax_normalize(win)` then `pad_window(win, seq_len)`; count of sub-window clips
+  printed at construction.
+
+#### B3 — one character re-silently reinstated the bug the metric switch exists to prevent
+
+- **Symptom.** `val_score = val_bal if SELECT_METRIC == 'balanced_accuracy' else val_acc`. No
+  validation, no warning — and the log *prints* `selection metric: {SELECT_METRIC}`, actively
+  confirming a metric the code is not using.
+- **Proof.** With a validation sequence where accuracy is exactly constant (0.4000) and balanced
+  accuracy rises 0.2479 → 0.5195: `'balanced_accuracy'` → no early stop, `best=0.5195`;
+  `'accuracy'` **and** `'balanced_acc'` → identical traces, `Early stopping at epoch 4`,
+  `best=0.4000`. A typo reproduces the *entire* §8.2-item-4 failure with zero diagnostics.
+- **Fix.** `assert SELECT_METRIC in (...)` at config time, and selection via dict lookup, so an
+  unhandled value is a `KeyError` rather than a behaviour change (`test_metric_guard.py`, 16 checks
+  over 7 candidate values).
+
+#### B4 — the leakage check could report a false all-clear
+
+- **Symptom.** `recording_id()` returned `parts[3]` of a 6-field
+  `CLASS-LABEL_ID_YEAR_TAPE_START_END.wav` name, falling back to *the whole file name* otherwise.
+- **Root cause.** Cell 8 — enabled by default, `RUN_CLIP_EXTRACTION = True` — writes **4-field**
+  names (`{species}-bat_{tape}_{start}_{end}.wav`). Every clip produced by this notebook's own
+  extractor therefore counted as its own "recording".
+- **Consequences.** The leakage check would print `0/N test clips share a recording with train` — a
+  false all-clear — and `SPLIT_BY_RECORDING = True` would degenerate into a plain random split while
+  claiming to hold out tapes. **The entire §8.2-item-6 narrative rests on this one function.**
+- **Proof (`test_b5_labels.py`).** Calls the notebook's **own** `recording_id` — obtained by `exec`ing
+  Cell 7 — with both layouts: 4-field → `20260429-192000` (old code returned the filename, making
+  every clip its own group), 6-field → `20260525-192000`. On the real dataset both old and new give
+  28 groups, so this fix changes **nothing** here and **everything** on re-extracted data.
+- **Fix.** Match the Raven timestamp `^\d{8}-\d{6}$` wherever it appears in the stem — present in
+  both layouts. Plus a `n_groups == n_files` warning, and a per-class recording-count table (which
+  makes the `heti = 1`, `rhbe = 2` problem impossible to miss).
+
+#### B5 — the summary table presented a signal-free model as "81% accurate"
+
+- **Symptom.** `OFFICIAL vs FINE-TUNED` printed
+  `official official_classifier_m09  0.8069  0.5000  0.4924`. The per-model block carried a `kind`
+  label; the headline table dropped it.
+- **Why it matters.** `0.8069` is exactly 117/145 — the model answers "not noise" for **every**
+  clip — and its AUC is 0.4924, i.e. *no noise signal at all*. §8.2 item 4 was written specifically
+  to stop plain accuracy on an 80/20 split from being read as skill; the fix table reintroduced it
+  one cell later, for the one model where it bites hardest.
+- **Fix.** `kind` and `n_files` columns, an explicit `NO SIGNAL (AUC~0.5)` marker, rows grouped by
+  denominator, and a closing line quoting **balanced accuracy** as the fair comparison.
+
+### 9.3 Also hardened (same failure class: silent wrong numbers)
+
+| Issue | Was | Now |
+| :--- | :--- | :--- |
+| Spectrogram cache validity | `os.path.exists(...)` — re-extracted clips silently reused **old** spectrograms | source wav size+mtime stored in a sidecar and validated on load |
+| Cache filename | bare basename — two `DATA_DIR`s with colliding basenames shared one entry | source directory hashed into the name |
+| `_CACHE_VERSION` | hand-maintained `'v2'` — editing the front end without bumping it reused stale cache | derived from `clip_to_db_spectrogram`'s source (with a fallback if the source is not locatable) |
+| `np.save` | not atomic — an interrupted build left a truncated `.npy` that every later run mmap'd as garbage | write to `.tmp` + `os.replace` |
+| A bad wav | `torch.stft` `RuntimeError` killed the whole run | per-file `try/except`, failures listed, clip **dropped visibly** |
+| NaN spectrogram | fed straight to the model | `np.nan_to_num` |
+| `train_window_starts` | percentile threshold — **ties select everything**. Measured: kept-fraction median 0.202 but max 1.000; 3 clips fully degenerate, i.e. uniform crops over the whole clip *including silence* = label noise | exact `ceil(top_frac·n)` by score, stable sort |
+| `predict_proba` | a clip with 0 windows → all-zero row whose `argmax` is class 0, a free "correct" prediction | hard error listing the offending files |
+| `n_freq_bins` | `dataOpts.get('n_freq_bins', 256)` — silently 256 for a model storing `num_mels` | `predict.py`'s fallback chain + a warning on non-`linear` `freq_compression` |
+| `names` for the confusion matrix | built by sorting `model_classes` by value — non-contiguous indices ⇒ `len(names) < n_outputs` ⇒ `confusion_matrix` reshape `IndexError` | indexed by output width |
+| `roc_auc_score` in the summary | unguarded — raises on a single-class fold, reachable under `SPLIT_BY_RECORDING=True` where `heti` vanishes | guarded |
+| `best_acc` / `'best_val_acc'` | names held a *balanced* accuracy | renamed in the new notebook's own cells |
+| `DET_CLASS_TO_IDX` | printed `{'noise': 0, 'call': 1}` but no dataset used it — a `KeyError: 'acsh'` away | removed; Cell 11 builds the real map |
+
+### 9.4 Challenge to Claude's claims in §8
+
+Each item is something I checked and found **wrong, unsupported, or misleadingly stated**. I have
+kept the substance and only corrected the reasoning — none of this invalidates §8's conclusions.
+
+1. **§8.9's "balanced accuracy still rising (0.89 → 0.93 over the last 10 epochs)" is a
+   max-versus-mean comparison and does not support raising `n_epochs`.** 0.89 is the *mean* of
+   epochs 45–60; 0.9301 is the single *maximum*, at epoch 58. Regressing properly:
+
+   | window | slope/epoch | t | extrapolated gain over the extra 40 epochs |
+   |---|---:|---:|---:|
+   | epochs 20–60 | +0.00094 | +2.09 | +0.037 |
+   | epochs 31–60 | +0.00138 | +2.15 | +0.055 |
+   | epochs 41–60 | +0.00159 | +1.52 | +0.064 |
+   | epochs 45–60 | +0.00050 | +0.43 | +0.020 |
+
+   There *is* a marginal trend over epochs 20–60 (t ≈ 2.1) — I was too strong when I first called
+   this unsupported. But over the last 20 epochs it is indistinguishable from zero, and the
+   expected gain is **+0.02 to +0.06 balanced accuracy = 1 to 3 clips on a 145-clip val set, where
+   one clip is worth 0.0221**. So the change is harmless and possibly mildly positive; the
+   *justification* was invalid. **§8.9's own local re-run confirms this prediction**: m09 test
+   0.931 vs 0.9241 at the old cap — +0.7 pt, i.e. inside the noise band. Rather than keep arguing,
+   the new notebook instruments it: `REPORT_TOPK_MEAN` prints the mean of the top-3 validation
+   scores beside the argmax, so selection optimism becomes a measurement.
+
+2. **§8.2 item 2 quotes the official detectors' `acc 0.63–0.70`, which is the wrong column.** The
+   official detectors over-predict `call` on this 81/19 split (noise precision 0.33–0.39), so
+   plain accuracy punishes them while leaving their *ranking* intact. On the metrics §8 itself
+   promoted, the official baseline is **balanced accuracy 0.729–0.798, AUC 0.836–0.883**. I also
+   recomputed the same `.pk` files under BatSpot's *own* sliding-window-max protocol from
+   `zeroshot_det.pkl`: `acc 0.855–0.873, bal 0.719–0.783, AUC 0.847–0.879`. The two protocols agree
+   to within 0.04 on balanced accuracy and AUC; only the accuracy-at-0.5 column differs, by 0.18–0.23.
+   **So fine-tuning's real gain is +0.09 to +0.19 balanced accuracy, not the "doubling" the
+   accuracy column implies** — smaller than advertised, but solidly real. (A first pass at this
+   review concluded the notebook was understating the official models by 20–25 points; that was
+   wrong, and comparing plain accuracy across protocols is precisely the habit §8.2 item 4
+   condemns. The notebook's protocol choice is fine.)
+
+3. **§8.2 item 5's "9 seed pairs" for the cascade has no artefact anywhere.** `results/*.json`
+   stores only `{acc, bal, mf1, auc}` per task — no cascade, gate or soft-combine outputs exist, and
+   `log_sweep1/2.txt` contain none. The notebook's own run shows a **tie** for m09 (0.8759 vs
+   0.8759). This is the load-bearing claim for Cell 14's redesign. (The conclusion still holds —
+   the gate never beat classifier-alone in any run I can see — but "9 seed pairs" is asserted, not
+   shown.)
+
+4. **§8.4's top-k ablation does not exist.** "Detector m09 (25-epoch run): top-1 0.903, top-3 0.931,
+   top-5 0.931, top-10 0.931" — there is no 25-epoch run in `results/` (all are `e40`/`e60`), no
+   top-k ablation script, and `topk` is hard-coded to 5 in every `gpuexp.run()` call. The
+   `zeroshot.py` top-3 is a *sliding-window* top-3, a different quantity. **`TEST_TOPK = 5` has
+   never been validated**, and §8.2 item 3 rests on it.
+
+5. **Cell 2's hyperparameters were measured under a different training loop.** `gpuexp.py:94`
+   selects checkpoints on `mv['acc']` (plain accuracy) and the sweep has **no `ReduceLROnPlateau`
+   and no early stopping**. So `base_lr = 3e-4`, the epoch caps and the patience values were chosen
+   for a training loop the notebook does not use. The conclusions survive — the final run
+   reproduced and improved on them — but the comments in Cell 2 present them as measured optima
+   *for this configuration*, which the evidence does not support.
+
+6. **§8.5's held-out-recording row quotes plain accuracy (0.880 vs 0.880) on the 117/28 split —
+   the exact habit §8.2 item 4 condemns.** The balanced accuracies are 0.689/0.660 (first 20 ms)
+   vs 0.641/0.708 (energy crop): call recall 0.97–0.99 but noise recall 0.30–0.44. The honest
+   held-out-recording figure is **≈0.64–0.71 balanced**, not 0.88. §8.2 item 6's conclusion
+   ("≈0.88, not 0.93") is directionally right and quantitatively wrong.
+
+7. **"This cell restores official behaviour" overclaims.** `PaddedSubsequenceSampler(random=True)`
+   crops **uniformly** over the clip (`transforms.py:465-470`); this cell restricts to the loudest
+   20 %, and at eval takes the top-5 *loudest* windows rather than a sliding window. Those are two
+   deliberate deviations, one for training and one for inference. The measured gain is
+   windowing-vs-`first`; the uniform-random-crop variant was never tested. (Also: `WINDOW_MODE='first'`
+   reproduces the old *window choice*, not the old *front end* — cubic `zoom` on the power spectrum,
+   no `1/sqrt(Σw²)`, channel 0 only.)
+
+8. **§8.2 item 1's "96% are >100 ms"** — measured, 95.9%. Immaterial, but it is the one figure in
+   §8 I could not reproduce exactly.
+
+9. **§2.10 says the official detector's `n_fft` is 128. It is 256.** Read from the `.pk` `dataOpts`:
+   all four official models are `n_fft 256, hop 128, n_freq_bins 256` (192 kHz detectors,
+   250 kHz classifier). Cell 2 has it right; the §2.10 table is wrong.
+
+### 9.5 What I added, and why
+
+Requested scope was "bugs + accuracy improvements". The improvements are all *measurement*
+improvements except the prior correction — deliberately, because §8 has already established that
+the modelling knobs are exhausted (LR 1e-2, 40/60 ms windows, detector ensembles and the gate are
+all measured dead ends).
+
+1. **Prior-corrected detector gate** (Cells 7, 14). `make_weighted_sampler` draws each class with
+   probability exactly `1/n_classes`, so the detector trains under a **50/50** noise/call prior
+   against an **19/81** eval prior — a **4.18×** shift in odds. That is why m09 showed noise
+   *precision* 0.70 against recall 0.93, and why the val-tuned thresholds sank to 0.30/0.40/0.10.
+   A threshold fitted that way **encodes the test noise fraction** and will not transfer to real
+   recordings, where noise is >95% of windows. `p_adj ∝ p · prior_eval/prior_train` makes 0.5 mean
+   what it says. Raw and corrected thresholds are both reported so §8's numbers stay comparable.
+   **I deliberately did not prior-correct the classifier**: its errors point the other way — 10 of
+   21 are false `acsh`, the *most common* class — so prior shift is not its problem. Its problem is
+   acoustic confusion between `acsh` and `alte` (both *Myotis*, near-identical 40–45 kHz FM sweeps).
+   Correcting it would have been a plausible-sounding change in the wrong direction.
+   *(A first draft of this cell inverted the detector prior — noise 0.807 / call 0.193 — which
+   `test_cell7.py` caught. It would have made the correction anti-corrective. Fixed and verified.)*
+
+2. **Recording-grouped retrain** (new Cell 21). The in-split number **cannot** be converted into a
+   new-recording estimate by arithmetic: the leakage check says 145/145 test clips share a recording
+   with train, so there is no clean subset to score. Holding out whole tapes and retraining is the
+   only honest way. Reported next to the in-split column, with the classes that vanished from the
+   grouped fold called out.
+
+3. **Augmentation A/B and seed spread** (new Cell 20). Every number in this project comes from one
+   145-clip split; run-to-run spread is ≈±2 pt, the same size as most differences being argued
+   about (cascade variants, m03 vs from-scratch, top-1 vs top-5). Seeds 42/43/44 each **re-split and
+   re-initialise**, so the reported sd is *total* spread — the conservative number, and the one that
+   decides whether any 1–3 pt delta is real.
+
+4. **Per-class recording counts** (Cell 7). Makes the `heti = 1` / `rhbe = 2` problem visible at the
+   point where the split is made, rather than inferable only from a confusion matrix.
+
+### 9.6 The honest bottom line
+
+The windowing fix in §8 is the real thing, and it is the reason every model improved 4–9 pt. I
+verified the mechanism quantitatively rather than taking it on trust:
+
+| | candidate windows/clip | train windows/clip | distinct train samples/epoch |
+|---|---:|---:|---:|
+| Classifier 250 kHz | median 231, max 1701 | median 47, mean 56 | **53,879** (was 964) |
+| Detector 192 kHz | median 178, max 1306 | median 36, mean 43 | **41,480** (was 964) |
+
+**×56 and ×43 more distinct training inputs**, and the mechanism is visible in the log: classifier
+train loss ends at **0.34** instead of **0.0004**. Memorisation became impossible.
+
+But the same arithmetic explains why the *remaining* errors did not shrink: **all ~56 windows of a
+clip come from one tape and are near-duplicates.** For generalisation the effective sample size is
+still **28 recordings**. That is why the classes recorded once or twice are perfect (`heti` 10/10,
+`rhbe` 16/16, `sasa` 14/14) while every class with many tapes carries the errors (`rhro` recall 0.57,
+`acsh` precision 0.68). It is leakage, and it is not fixable in code.
+
+**So the ranked answer to "how do we get more accuracy?" is:**
+
+1. **More recordings** of `rhro`, `rhle`, and the `acsh`↔`alte` pair — plus a **label review** of
+   `acsh`/`alte`, since 10 of 21 errors are false `acsh` and that pair is genuinely hard.
+2. **Choose the detector threshold on full-length recordings** with the sliding window, and judge
+   false alarms there. Nothing in this repo has ever evaluated that, and the test split's 19% noise
+   fraction is unrepresentative of real audio. This is the largest *unmeasured* risk in the project.
+3. **Report the grouped score next to every in-split number** — now automated (Cell 21).
+4. **Report mean ± sd over seeds** — now automated (Cell 20).
+
+Not worth doing, on evidence: LR 1e-2, longer input windows, detector ensembles, the
+detector→classifier gate.
+
+### 9.7 Known limits of *my* work — read before trusting §9
+
+- **The new notebook has not been run end to end.** Every fix is verified by targeted tests
+  (107 assertions, 6 suites) and the cells parse, but no full 22-cell execution on Kaggle or GPU
+  has happened.
+  The `DataParallel` path and the two new cells are untested at scale. **Run it before drawing
+  conclusions from it.** Expected main-pipeline results should be close to §8.9's, since all five
+  bugs are latent on this dataset.
+- **Cell 2's hyperparameters are inherited, not re-derived** — see §9.4 item 5. I documented the
+  caveat rather than re-running the sweep, which would have cost a GPU day.
+- **The prior-correction factor is computed from the *test* split's class proportions** when applied
+  at test time, and from the val split's when tuning. That is legitimate for reproducing an in-split
+  number but it is **not** the deployment prior: for real recordings you must supply the actual
+  expected noise fraction. The correction machinery is the deliverable, not a universal threshold.
+- **The grouped check retrains only the classifier and m09** (`GROUPED_MICS`). Retraining all three
+  mics triples the cost for no extra insight.
+- **`REPORT_TOPK_MEAN = 3` is a convention**, not a derived value. The right choice depends on how
+  many validations the run has.
+- **My `recording_id` regex assumes the tape id contains a Raven `YYYYMMDD-HHMMSS` timestamp.**
+  That holds for both layouts in this repo. A dataset with different naming would fall back to the
+  file stem, and Cell 7 prints a loud warning when `n_groups == n_files` — but it would degrade to
+  "no grouping" rather than error.
+- **None of §9 changes §8's numbers**, and I have not re-run the pipeline. §9 is a review plus fixes
+  plus instrumentation; the accuracy claims in §8.6/§8.9 stand as written, with the metric caveats
+  in §9.4.
+
+### 9.8 How the fixes were verified — and four vacuous tests I found in my own work
+
+A test that passes both with and without the fix tests nothing. After the suites were green I wrote
+`redgreen.py`, which reverts **one fix at a time** in a scratch copy and asserts the matching suite
+then fails. Current result: **8/8 reverts detected.**
+
+```
+reverted fix                             suite                   exit  FAILs  detected
+B1  save_path gates best_state           test_bug1.py               1      3  YES
+B2  pad before min-max                   test_dataset.py            1      2  YES
+B2  pad before min-max (unit)            test_fixes.py              1      3  YES
+B3  SELECT_METRIC silent fallback        test_metric_guard.py       1      2  YES
+B4  positional recording_id              test_b5_labels.py          1      3  YES
+B5  unlabelled summary rows              test_b5_labels.py          1      3  YES
+--  stale spectrogram cache              test_dataset.py            1      1  YES
+--  percentile-tie window selection      test_fixes.py              1      1  YES
+```
+
+**The first run of this harness failed 4 of 9, and all four failures were my own test defects, not
+notebook defects.** Recording them because the pattern is the whole point:
+
+1. **B4 was tested against a copy, not the code.** `test_fixes.py` had `exec`'d its *own* inline
+   `recording_id` and asserted against that. Reverting the notebook's function changed nothing the
+   test could see. The assertion was true of a function no notebook would ever run.
+   Fixed: `test_b5_labels.py` now `exec`s Cell 7 and calls the notebook's `recording_id` directly.
+2. **B4 was also undetectable on this dataset.** `test_cell7.py` runs Cell 7 for real and found 28
+   recordings both before and after the revert — because every file in `Data/final_dataset/data`
+   uses the 6-field layout, which the old positional code handled correctly. **The bug is only
+   reachable on Cell-8-extracted data.** A test on the available data cannot detect it; the fix has
+   to assert on the 4-field layout explicitly, which is what the new suite does.
+3. **B5 had no test at all.** When I rewrote `test_fixes.py` mid-task I dropped the static string
+   checks for the summary table, and never replaced them. B5 was verified only by my reading. Its
+   fix is the one with the most surface (a table), so this was the worst gap. Fixed:
+   `test_b5_labels.py` builds synthetic `val_results` including a signal-free model, `exec`s Cell 18,
+   captures stdout, and asserts on the **rendered table** — `n` column, `Note` column, `NO SIGNAL` on
+   the dead row, no `official official_`, balanced-accuracy gain line.
+4. **The stale-cache revert crashed instead of failing an assertion.** My revert helper returned
+   `True` from `_cache_is_valid` when the file was *absent*, which is not the original bug (the
+   original was `os.path.exists(...)` — valid on existence, ignoring the source). The harness reported
+   exit≠0 and I nearly counted that as detection. It was an unrelated `FileNotFoundError`. Fixed by
+   making the revert faithful to the original code.
+
+Two further harness defects, worth noting because they would have produced a **false all-green**:
+my first `sed` re-pointing the suites at the delivered notebook only patched 2 of 5 files (the other
+three defined `NEW` with a filename appended), so three suites were still reading the scratch
+directory — and `test_b5_labels.py` reads `NEW_CELLS` from the environment, which `redgreen.py`
+was not passing, so B4/B5 "passed" against **unmutated** cells. Both are now asserted explicitly:
+`redgreen.py` sets `NEW_CELLS`, and the reproduce block above greps for leftovers.
+
+**What this does and does not establish.** It establishes that each fix changes the behaviour the
+test observes, in the direction claimed, and that no fix is a no-op. It does **not** establish that
+the notebook produces the right accuracy numbers — nothing here has run training. §9.7's first bullet
+still stands: the notebook has not been executed end to end.
