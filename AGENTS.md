@@ -1291,3 +1291,29 @@ tab-separated Raven table per recording in `raven_tables/` (`INFER_WRITE_RAVEN_T
   (exec's every code cell, swaps only the Kaggle paths), `analysis.py` (chunking / resampling
   equivalence, runtime, scan-setting sweep), `test_build_selections.py`, `test_clock.py`,
   `test_freq_impl.py`, the cell sources (`newcells/`) and the logs of every run quoted here.
+
+### 10.6 More capacity (hidden layers / deeper encoder) does not help — measured
+
+Question: are the official models too small? **No.** Two measurements (local RTX 4050, same split, same
+`train_model` loop and config as the notebook; scripts `fit_gap.py`, `capacity_exp.py` in the folder above):
+
+1. **Fit gap.** Clip-level accuracy (eval protocol) of the trained models on their own *training* clips vs
+   unseen clips: classifier 0.911 train / 0.883 val / 0.855 test; detector m11 balanced 0.931 / 0.927 /
+   0.909; m09 0.963 / 0.921 / 0.917. Not memorising — the classifier misses ~9 % of its own training clips —
+   so capacity *could* have been the limit. Hence:
+2. **Capacity experiment, classifier, 3 seeds each** (mean ± sd):
+
+| Variant | Params | Train-clip acc | Test acc | Test bal. acc |
+| :--- | ---: | ---: | ---: | ---: |
+| official: pretrained ResNet-18 + linear head | 11.2 M | 0.910 | 0.851 ± 0.004 | 0.859 ± 0.009 |
+| pretrained ResNet-18 + hidden layer 512→256 (ReLU, dropout 0.3) → 8 | 11.3 M | 0.913 | 0.839 ± 0.014 | 0.849 ± 0.012 |
+| ResNet-34 from scratch (no official R34 weights) | 21.3 M | 0.917 | 0.855 ± 0.018 | 0.865 ± 0.018 |
+
+   Training-clip accuracy stays at ~0.91 even with twice the parameters (ResNet-34's training loss is lower,
+   0.16–0.25 vs 0.25–0.30, but its clip accuracy is not), so the remaining errors are not a capacity limit:
+   they come from the input (one 20 ms window often cannot separate acsh/alte or rhle/rhro; 40 / 60 ms
+   windows did not help either, §8.9) and from the labels / recordings (§8.2 item 6). Test differences
+   are within the seed spread. Also: a hidden-layer head changes the `.pk` layout, so the exported model
+   would **no longer load in the BatSpot GUI / `predict.py`**; ResNet-34 loads there but costs ~1.8× the
+   training time and gives up the official pretrained weights. **Not adopted.** What would move accuracy:
+   more recordings of rhle / rhro / acsh / alte, a label review of acsh↔alte, and a recording-grouped score.
