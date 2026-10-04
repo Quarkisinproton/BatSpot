@@ -486,7 +486,7 @@ Do not assume these are handled.
    `save_path` only as a truthiness gate for the in-memory `best_state`
    snapshot. There is **no `savefig` anywhere**, and the returned history is
    discarded at the call site. No curves PNG is ever written and no training
-   curves survive a run.
+   curves survive a run. **Fixed in `batspot-train.ipynb` (§10.2): curves are written; history kept.**
 5. **DataLoader teardown spew — *unconfirmed*.** Kaggle floods output with
    `Exception ignored in: <function _MultiProcessingDataLoaderIter.__del__ ...>
    AssertionError: can only test a child process`, once per loader teardown.
@@ -499,7 +499,7 @@ Do not assume these are handled.
    `tqdm` wrapping the train loader, and/or Kaggle-specific process supervision.
 6. **`RUN_CLIP_EXTRACTION = True`** by default in `batspot-train.ipynb` and
    `BatSpot_FineTune_Kaggle.ipynb` (§2.6). Safe due to the second guard, wrong
-   as a default.
+   as a default. **Fixed in `batspot-train.ipynb` (§10.2): now `False`.**
 
 ## 4. Model and data inventory
 
@@ -1177,3 +1177,117 @@ was not passing, so B4/B5 "passed" against **unmutated** cells. Both are now ass
 test observes, in the direction claimed, and that no fix is a no-op. It does **not** establish that
 the notebook produces the right accuracy numbers — nothing here has run training. §9.7's first bullet
 still stands: the notebook has not been executed end to end.
+
+---
+
+## 10. Notebook comparison + inference cells — Claude (2026-10-04)
+
+Scope: compare `batspot-train.ipynb` with `batspot_train(claude_bug_fixes _by__SPACE_BUNNY_MODEL).ipynb`
+(§9), port what is worth porting, and add cells that run the best detector + classifier over a folder of
+new recordings and write a Raven-style selection text file. **Only `batspot-train.ipynb` was changed.**
+Scripts and logs: `/home/gb/batspot_gpu_experiments/inference_cells_2026-10-04/` (outside the repo, §10.5).
+
+### 10.1 The two notebooks, side by side
+
+Same pipeline, same front end, same training loop, same split, same models. 11 of 19 code cells are
+byte-identical. `batspot-train.ipynb` already carries the §8.10 versions of Space Bunny's B1–B5 fixes,
+so the real differences are:
+
+| Area | `batspot-train.ipynb` (before this section) | Space Bunny notebook | Done here |
+| :--- | :--- | :--- | :--- |
+| `recording_id` | regex `\d{8}-\d{6}` (hyphen only) | `(\d{8})[-_](\d{6})` | **Ported.** Cell 8 / AudioMoth names use `_`; the old regex fell back to one group per clip (with a warning). Same 28 groups on the current data. |
+| `save_path` | only documented as inert; no curves written | writes a 3-panel PNG + top-k-mean diagnostics | **Ported (curves only).** |
+| zero-window clip in `predict_proba` | silently scored as class 0 | `RuntimeError` | **Ported.** |
+| detector threshold grid | 0.10–0.90 (m11 sat on the 0.10 edge) | 0.05–0.95 | **Ported.** |
+| cache hardening (size+mtime sidecar, dir hash, atomic save, skip failed wavs, NaN guard) | `os.path.exists` | yes | Not ported: a Kaggle session starts with an empty cache, and dropping clips per dataset can desynchronise the detector/classifier test lists (the cascade then raises). |
+| prior-corrected gate | — | yes | Not ported: with a validation-tuned threshold, rescaling P(call) by a constant prior ratio is monotone, so the tuned gate makes the same decisions (up to the grid); it only matters for a fixed threshold, and then the needed prior is the *deployment* one, which is unknown. The test-time correction also uses the test split's class balance. |
+| augmentation A/B + 3-seed spread (Cell 20) | — | on by default, ~5 extra classifier trainings | Not ported (≈ +25 min on Kaggle). `SEED` added instead so a run is repeatable. |
+| recording-grouped retrain (Cell 21) | — | on by default | Not ported; still the right next measurement (§8.7). Available in the Space Bunny notebook, which has never been run end to end (§9.7). |
+| export | `model.cpu()` **in place** | same | **Fixed here** (both had it): after Cell 15 the live models sat on the CPU, so any later GPU use (the new inference cells) crashed. Now a CPU copy is exported. |
+
+### 10.2 Changes to existing cells of `batspot-train.ipynb`
+
+| Cell | Change |
+| :--- | :--- |
+| 1 (md) | pipeline step 9 (inference) |
+| 2 | `RUN_CLIP_EXTRACTION = False` (the comment always said so; §3 item 6); `SEED = 42` |
+| 6 | `predict_proba` raises on a clip without windows |
+| 7 | `recording_id` accepts `-` or `_` between date and time |
+| 9 | `set_seed()`; `save_path` now writes the training curves (§3 item 4); history keeps `val_epoch`, `lr`, `best_epoch` |
+| 12, 13 | `set_seed(SEED)` before each model is built; `det_results[mic]['history']` kept |
+| 14 | threshold grid 0.05–0.95 |
+| 15 | export a CPU copy (`copy.deepcopy(model).cpu()`) instead of moving the live model |
+| 20–24 | **new** inference section (§10.3) |
+
+### 10.3 Inference cells (21–24): what they do and why each default is what it is
+
+Upload a folder (or `.zip`) of recordings as a Kaggle dataset, set `INFER_INPUT_DIR` in Cell 21, run
+Cells 21–23 (after training, or after Cells 2–6 with `INFER_DETECTOR_PK` / `INFER_CLASSIFIER_PK` set to
+exported `.pk` files). Output: `/kaggle/working/batspot_detections.txt`, comma-separated, header exactly
+
+`Selection,name_of_file,Channel,Begin Time (s),End Time (s),Begin Clock Time,End Clock Time,Low Freq (Hz),High Freq (Hz),Peak Freq (Hz),Delta Time (s),Species detected,Confidence`
+
+plus `batspot_detections_rejected_noise.txt` (same format, selections the classifier calls `noise`) and one
+tab-separated Raven table per recording in `raven_tables/` (`INFER_WRITE_RAVEN_TABLES`).
+
+| Step | Implementation | Evidence / reason |
+| :--- | :--- | :--- |
+| Combo | detector variant with the best **validation** `SELECT_METRIC` (ties → m09) + the fine-tuned classifier | never selects on test; the m03/m09/m11 ranking is within noise anyway (§8.10) |
+| Scan | 20 ms windows, 10 ms hop, per-window min-max, threshold 0.5 | official BatSpot `config_predict` for these detectors (`sequence_len=0.02`, `hop=0.01`, `threshold=0.5`, `min_max_norm=true`) |
+| Front end | `clip_to_db_spectrogram` (the training function) on chunks of `INFER_CHUNK_S` = 60 s with 16 frames of left context | chunked vs one 300 s pass: max\|ΔP\| = 0 |
+| Resampling 384→192 kHz | resampy `kaiser_best` at an exact 2:1 ratio is a fixed 199-tap FIR, applied as a strided GPU `conv1d` (TF32 off) | waveform max\|diff\| 6.7e-8 vs resampy; detector max\|ΔP\| 1.4e-4; self-check vs resampy runs on every start. Other ratios use resampy. |
+| fp16 scan (`INFER_AMP`) | autocast for the detector scan only (training also ran forward passes under autocast) | 1.7× faster; max\|ΔP\| 2.4e-3, 4 of 29 998 windows flipped at 0.5. Classifier stays fp32. |
+| Selections | positive windows ≤ `INFER_MERGE_GAP_S` = 0.1 s apart merge; ≥ `INFER_MIN_WINDOWS` = 2; longer than `INFER_MAX_SELECTION_S` = 1.0 s → split at the widest internal silence (central split on ties) | annotated boxes: median 0.375 s, 95 % < 1.05 s. Without the cap, continuous activity produced 5.8 s rows. Unit-tested (merge, split at silence, even split of continuous runs, no lost windows). |
+| Species | each selection scored like a test clip (top-5 loudest windows, softmax averaged, fp32); `Confidence` = that averaged probability of the reported species; argmax `noise` → rejected file | same protocol as validation/test, so the classifier sees the input distribution it was selected on |
+| Frequencies | spectrogram at native rate, Hann, `nfft = 2^ceil(log2(sr/375))` (1024 at 384 kHz = Raven's resolution in the training tables; Peak inside the annotated box matches Raven's exactly in 89 %), 50 % overlap; background = per-frequency median over the selection ± 1 s; Low/High = contiguous band around the bin highest above background, keeping bins ≥ 12 dB above background and within 25 dB of that bin's level; Peak = loudest cell in the band; search limited to 10–150 kHz | 400 annotated boxes, median error for bats: Peak 0.0 kHz (within one bin 65 %), Low 2.4 kHz, High 3.2 kHz. Rejected on the same boxes: plain −20 dB band (~10 kHz error); median over the selection only (rhle/rhro Peak ~57 kHz off: their CF calls fill most frames, so the median *is* the call); low-percentile backgrounds (13–39 kHz); 3×3 smoothing (breaks rhle). Without the ceiling a click gave 192 000 Hz (near-Nyquist bins have ~zero background). **Weak spot:** Low for rhle/rhro is still often 40–55 kHz too low (faint CF calls; the band bridges into noise); 84 of 1118 test rows touch the 10 or 150 kHz limit. |
+| Clock time | start from `YYYYMMDD[_-]HHMMSS` in the file name (+ clip offset for BatSpot clip names), else the AudioMoth `Recorded at …` header, else 00:00:00 (reported) | 501 annotated boxes: identical to Raven's `Begin Clock Time` (max difference 0.00 ms) |
+
+### 10.4 Verification
+
+* **Smoke test with the official models** (skip-training path, `INFER_*_PK`): 80 files, all cells ran.
+* **Full notebook end to end, twice** (local RTX 4050, cold cache, 618 s, 0 errors): all 22 code cells.
+  Training results identical to 4 decimals in both runs (`SEED`): detectors m03/m09/m11 test balanced
+  accuracy 0.878 / 0.917 / 0.910 (val 0.891 / 0.921 / 0.927 → m11 auto-selected), classifier test
+  accuracy 0.855, balanced 0.870 — inside the §8.10 spread.
+* **Local stand-in for the upload: 7 species folders × ≤12 ten-second 384 kHz excerpts** (80 files; heti
+  is one recording, so 8) cut from `Data/audio` around annotated boxes, named with their true clock start,
+  with shifted truth tables for Cell 24. In-sample: these are the training recordings. Final result:
+  1118 selections kept + 152 rejected as noise; **492/509 annotated bat boxes found (0.967), species
+  correct on 387/492 (0.787), 1/9 noise boxes hit**; 133 s for 13 min of audio. Weakest: rhle (48/76)
+  and rhro (72/104) — confused with each other and with acsh — and alte → acsh (16), as in §8.9.
+  The exported-`.pk` path gives exactly the same selections and species as the in-memory models.
+* **Output file**: header exactly as requested, `Selection` 1..N, `Delta Time` = End − Begin, all
+  selections ≤ 1 s, Low ≤ High.
+* **Full 5-min recordings** (28 annotated recordings, exported `.pk`, detector m11 = best validation):
+
+| Scan setting (after classifier noise filter, 10 recordings) | bat boxes found | species correct on found | noise boxes hit |
+| :--- | ---: | ---: | ---: |
+| thr 0.5, gap 0.1, ≥2 windows, max 1.0 s (**default**) | 0.981 | 0.797 | 3/36 |
+| thr 0.5, gap 0.2 | 0.971 | 0.795 | 4/36 |
+| thr 0.7, gap 0.2 | 0.955 | 0.789 | 2/36 |
+
+  Detector only, all 28 recordings: threshold 0.5 → 0.986 of boxes found, 76/186 noise boxes hit
+  *before* the classifier's noise filter; 0.9 → 0.879 and 6/186. Only ~8 % of selections overlap an
+  annotated box because the tables mark a fraction of the calls in each recording, so **precision cannot be
+  measured from them**. Runtime: 8.3 s per 5-min file (scan 8.1 s), i.e. ~12 min for 84 such files on the
+  laptop GPU.
+
+### 10.5 Known limits and how to reproduce
+
+* **Nothing here was run on Kaggle.** Everything ran locally (RTX 4050, torch 2.14.1+cu130). The
+  `DataParallel` training path is unchanged; the inference cells use a single GPU.
+* **All accuracy numbers in §10.3–10.4 are in-sample** (the excerpts and full recordings are the ones the
+  training clips were cut from). The real test is the uploaded set; if it has Raven tables, set
+  `INFER_TRUTH_DIR` and read Cell 24.
+* **Precision / false-alarm rate on real recordings is still unmeasured**: the training tables mark only
+  some of the calls in each recording. Threshold 0.5 is the official BatSpot value; 0.7 trades ~2.5 pt of
+  recall for fewer noise hits (§10.4 table).
+* **rhle / rhro CF calls (~90–100 kHz) sit at the top of the detector band** (official `fmax` 95 kHz,
+  kept because the pretrained encoder was trained on it). The detector still found 76/81 and 104/109 of
+  their boxes here, but they remain the weakest classes.
+* `Confidence` is a softmax score, not a calibrated probability.
+* Reproduce: everything is in `/home/gb/batspot_gpu_experiments/inference_cells_2026-10-04/` (outside the
+  repo; see its `README.txt`): `build_testset.py` (cuts `Data/audio` + `Data/selections`), `run_local.py`
+  (exec's every code cell, swaps only the Kaggle paths), `analysis.py` (chunking / resampling
+  equivalence, runtime, scan-setting sweep), `test_build_selections.py`, `test_clock.py`,
+  `test_freq_impl.py`, the cell sources (`newcells/`) and the logs of every run quoted here.
