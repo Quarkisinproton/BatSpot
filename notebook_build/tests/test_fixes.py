@@ -28,7 +28,20 @@ CELL_DATASET, CELL_DATA, CELL_PIPELINE = 5, 6, 13
 fails = []
 
 
-def check(name, cond, detail=''):
+def check(name, cond, detail='', guarded=False):
+    """One assertion. `cond` and `detail` may be callables, evaluated lazily.
+
+    `guarded=True` marks a check that needs cell 5's definitions. When cell 5 could not be
+    isolated those checks report FAIL with the isolation error and the callables are never
+    called -- which is what keeps a renamed definition from turning into a traceback part-way
+    through the suite.
+    """
+    if guarded and CELL5_ERROR:
+        cond, detail = False, CELL5_ERROR
+    if callable(cond):
+        cond = cond()
+    if callable(detail):
+        detail = detail()
     print(f'  [{"PASS" if cond else "FAIL"}] {name}' + (f'  -- {detail}' if detail else ''))
     if not cond:
         fails.append(name)
@@ -50,7 +63,16 @@ print(f'=== under test: {os.environ.get("NEW_CELLS") or extract_cells.MERGED} ==
 
 FN = {'minmax_normalize', 'pad_window', 'window_scores', 'train_window_starts',
       'eval_window_starts'}
-fns = defs(idx[CELL_DATASET], FN, np=np, os=os)
+# Cell 5 is a port target (Task 3), so a rename there must not traceback this suite part-way
+# through. If it cannot be isolated, `fns` stays empty and the 16 checks that need it report
+# FAIL with the reason (`guarded=True` in check() below) instead of raising.
+CELL5_ERROR = None
+try:
+    fns = defs(idx[CELL_DATASET], FN, np=np, os=os)
+except Exception as e:      # any isolation failure is a reportable FAIL, not a traceback
+    fns = {}
+    CELL5_ERROR = f'{type(e).__name__}: {e}'
+    print(f'  (cell {CELL_DATASET} could not be isolated: {CELL5_ERROR})')
 
 # --- reference for attribution only: the pre-fix min-max/pad ORDER -------------------------
 def pad_then_minmax(win, seq_len):
@@ -92,21 +114,35 @@ np.save(HOLD, db)   # _window np.load()s this; _mmap() bypasses it
 
 
 print('\n=== FIX 2: min-max / pad ORDER (cell 5, _window) ===')
-w = extract_cells.cell_method(idx[CELL_DATASET], 'WindowedBatDataset', '_window',
-                              dict(fns))(Holder(), 0, 0)
-w_ref = pad_then_minmax(db, SEQ)
-check('shapes match', w.shape == (SEQ, 4) == w_ref.shape, str(w.shape))
+# `_window` reads np/os at call time, so the method namespace must carry them even when cell_defs
+# failed and `fns` came back empty. Any failure here is recorded and reported, never raised.
+ns5 = {'np': np, 'os': os, **fns}
+try:
+    w = extract_cells.cell_method(idx[CELL_DATASET], 'WindowedBatDataset', '_window',
+                                  ns5)(Holder(), 0, 0)
+    w_ref = pad_then_minmax(db, SEQ)
+except Exception as e:      # any extraction failure is a reportable FAIL, not a traceback
+    w = w_ref = None
+    CELL5_ERROR = CELL5_ERROR or f'{type(e).__name__}: {e}'
+
+check('shapes match', lambda: w.shape == (SEQ, 4) == w_ref.shape,
+      lambda: str(w.shape), guarded=True)
 check('a pad-first reference fills the padded region with 1.0 (silence as loudest feature)',
-      abs(w_ref[:PAD].mean() - 1.0) < 1e-6, f'reference pad mean={w_ref[:PAD].mean():.4f}')
+      lambda: abs(w_ref[:PAD].mean() - 1.0) < 1e-6,
+      lambda: f'reference pad mean={w_ref[:PAD].mean():.4f}', guarded=True)
 check('the notebook leaves the padded region at 0.0 (matches official)',
-      abs(w[:PAD].mean()) < 1e-9, f'pad mean={w[:PAD].mean():.4f}')
+      lambda: abs(w[:PAD].mean()) < 1e-9, lambda: f'pad mean={w[:PAD].mean():.4f}', guarded=True)
 check('the notebook still normalises the real signal to 1.0',
-      abs(w[PAD:PAD + 12].max() - 1.0) < 1e-6, f'max={w[PAD:PAD + 12].max():.4f}')
+      lambda: abs(w[PAD:PAD + 12].max() - 1.0) < 1e-6,
+      lambda: f'max={w[PAD:PAD + 12].max():.4f}', guarded=True)
 check('the pad-first reference squashes the real signal below 1.0',
-      w_ref[PAD:PAD + 12].max() < 1.0, f'reference max={w_ref[PAD:PAD + 12].max():.4f}')
-check('the notebook output differs from the pad-first reference', not np.allclose(w, w_ref))
+      lambda: w_ref[PAD:PAD + 12].max() < 1.0,
+      lambda: f'reference max={w_ref[PAD:PAD + 12].max():.4f}', guarded=True)
+check('the notebook output differs from the pad-first reference',
+      lambda: not np.allclose(w, w_ref), guarded=True)
 check('a window at least seq_len long is unaffected by the order',
-      np.allclose(fns['minmax_normalize'](db), pad_then_minmax(db, db.shape[0])))
+      lambda: np.allclose(fns['minmax_normalize'](db), pad_then_minmax(db, db.shape[0])),
+      guarded=True)
 
 
 def percentile_top(starts, scores, top_frac):
@@ -119,40 +155,47 @@ print('\n=== train_window_starts: percentile ties selected EVERYTHING (cell 5) =
 starts = np.arange(0, 60, 3)
 n = len(starts)
 tied = np.ones(n)
+uniq = rs.uniform(0, 1, n)
 k_ref = len(percentile_top(starts, tied, 0.20))
-k_new = len(fns['train_window_starts'](starts, tied, 'energy_crop', 0.20))
+tw = fns.get('train_window_starts')
+k_new = len(tw(starts, tied, 'energy_crop', 0.20)) if tw else None
+kn = len(tw(starts, uniq, 'energy_crop', 0.20)) if tw else None
+_tie_a = tw(starts, tied, 'energy_crop', 0.20) if tw else None
+_tie_b = tw(starts, tied, 'energy_crop', 0.20) if tw else None
+topk = set(starts[np.argsort(-uniq, kind='stable')[:kn]].tolist()) if kn else set()
 # Asserting only `k_ref == n` would test the local reference and nothing else. The property that
 # matters is the CONTRAST: the reference keeps every tied window and the cell does not.
 check('a percentile-threshold reference keeps ALL tied windows; the notebook does not',
-      k_ref == n and k_new != k_ref, f'reference kept {k_ref}/{n}, notebook kept {k_new}')
-check('the notebook selects exactly ceil(20%)', k_new == int(np.ceil(n * 0.20)), f'{k_new}/{n}')
-uniq = rs.uniform(0, 1, n)
-kn = len(fns['train_window_starts'](starts, uniq, 'energy_crop', 0.20))
-topk = set(starts[np.argsort(-uniq, kind='stable')[:kn]].tolist())
+      lambda: k_ref == n and k_new != k_ref,
+      lambda: f'reference kept {k_ref}/{n}, notebook kept {k_new}', guarded=True)
+check('the notebook selects exactly ceil(20%)',
+      lambda: k_new == int(np.ceil(n * 0.20)), lambda: f'{k_new}/{n}', guarded=True)
 check('the notebook returns the loudest k, not a threshold set',
-      set(fns['train_window_starts'](starts, uniq, 'energy_crop', 0.20).tolist()) == topk)
+      lambda: set(tw(starts, uniq, 'energy_crop', 0.20).tolist()) == topk, guarded=True)
 # Under ties every window is equally loud, so a rank-based stable selection must return the
 # first k in position order -- the same windows every time. Asserting only the COUNT would be
 # near-vacuous: any implementation returning n_keep values would pass.
-_tie_a = fns['train_window_starts'](starts, tied, 'energy_crop', 0.20)
-_tie_b = fns['train_window_starts'](starts, tied, 'energy_crop', 0.20)
 check('the notebook is deterministic under ties (same windows on every call)',
-      np.array_equal(_tie_a, _tie_b) and np.array_equal(_tie_a, starts[:k_new]),
-      f'{_tie_a.tolist()} vs {starts[:k_new].tolist()}')
+      lambda: np.array_equal(_tie_a, _tie_b) and np.array_equal(_tie_a, starts[:k_new]),
+      lambda: f'{_tie_a.tolist()} vs {starts[:k_new].tolist()}', guarded=True)
 check('fewer than 3 windows returns all of them',
-      len(fns['train_window_starts'](np.array([0, 3]), np.array([1.0, 2.0]),
-                                     'energy_crop', 0.20)) == 2)
+      lambda: len(tw(np.array([0, 3]), np.array([1.0, 2.0]), 'energy_crop', 0.20)) == 2,
+      guarded=True)
 check("mode='first' still returns exactly one window",
-      len(fns['train_window_starts'](starts, uniq, 'first', 0.20)) == 1)
+      lambda: len(tw(starts, uniq, 'first', 0.20)) == 1, guarded=True)
 
 print('\n=== eval_window_starts: greedy NMS over the loudest windows (cell 5) ===')
-sel = np.sort(fns['eval_window_starts'](starts, uniq, 'energy_crop', 5, 30))
-check('the first pick is the loudest window', sel[0] == starts[int(np.argmax(uniq))],
-      f'first pick {sel[0]}, loudest {starts[int(np.argmax(uniq))]}')
-g = np.diff(sel)
-check('consecutive picks >= seq_len//2 apart', len(g) == 0 or g.min() >= 15,
-      f'min gap {g.min() if len(g) else "-"}')
-check("mode='first' unchanged", len(fns['eval_window_starts'](starts, uniq, 'first', 5, 30)) == 1)
+ew = fns.get('eval_window_starts')
+sel = np.sort(ew(starts, uniq, 'energy_crop', 5, 30)) if ew else None
+g = np.diff(sel) if sel is not None else None
+check('the first pick is the loudest window',
+      lambda: sel[0] == starts[int(np.argmax(uniq))],
+      lambda: f'first pick {sel[0]}, loudest {starts[int(np.argmax(uniq))]}', guarded=True)
+check('consecutive picks >= seq_len//2 apart',
+      lambda: len(g) == 0 or g.min() >= 15,
+      lambda: f'min gap {g.min() if len(g) else "-"}', guarded=True)
+check("mode='first' unchanged",
+      lambda: len(ew(starts, uniq, 'first', 5, 30)) == 1, guarded=True)
 
 # How bad the tie rule could get on the real clips, if every window scored the same.
 allw = sorted(glob.glob(f'{extract_cells.REPO}/Data/final_dataset/data/*/*.wav'))
@@ -167,11 +210,11 @@ for f in allw:
         nf = 1 + (int(round(info.frames / info.samplerate * sr)) - n_fft) // hop
         if nf <= seq:
             continue
-        w = len(np.arange(0, nf - seq + 1, stride))
-        sc = np.ones(w)                      # worst case: all tied
-        k = len(np.arange(w)[sc >= np.percentile(sc, 100 * (1 - top_frac))])
-        worst = max(worst, w)
-        bad = bad or k == w
+        n_windows = len(np.arange(0, nf - seq + 1, stride))
+        sc = np.ones(n_windows)              # worst case: all tied
+        k = len(np.arange(n_windows)[sc >= np.percentile(sc, 100 * (1 - top_frac))])
+        worst = max(worst, n_windows)
+        bad = bad or k == n_windows
     degen += bad
 print(f'    (worst-case tied-score clips the percentile rule would keep ALL {worst} windows for: '
       f'{degen} of {len(allw)}, vs the notebook\'s ceil(20%) cap)')
@@ -202,9 +245,18 @@ else:
     check('different tapes stay apart', rid(four) != rid(six))
 _old = lambda p: (os.path.basename(p)[:-4].split('_')[3]
                   if len(os.path.basename(p)[:-4].split('_')) >= 6 else os.path.basename(p))
-check('ATTRIBUTION: the positional parse was broken on 4-field names',
-      _old(four) == four, '-> every clip its own group')
+# A CONTRAST on the outcome the bug broke, not on the return value. The positional parse only
+# works on 6-field names, so the contrast must be measured on Cell 8-style 4-field output --
+# there the old code gives every clip its own group, the notebook groups them into tapes.
+_c8a = 'sasa-bat_20260429-192000_215755_215781.wav'
+_c8b = 'sasa-bat_20260429-192000_999999_999999.wav'
+_old_c8 = len({_old(_c8a), _old(_c8b)})
+_nb_c8 = len({rid(_c8a), rid(_c8b)}) if rid is not None else 0
 grp = {rid(w) for w in allw} if rid is not None else set()
+check('on Cell 8 output the positional parse gives one group per clip; the notebook groups '
+      'them into tapes',
+      rid is not None and _old_c8 == 2 and _nb_c8 == 1,
+      _NO_RID if rid is None else f'old {_old_c8} groups / 2 clips vs notebook {_nb_c8} group')
 check('real dataset: 28 groups (not 964)',
       rid is not None and len(grp) == 28,
       _NO_RID if rid is None else f'{len(grp)} groups / {len(allw)} clips')

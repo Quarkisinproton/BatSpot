@@ -80,13 +80,16 @@ check('a name with no timestamp degrades to the stem (documented)',
       rid('weird-name.wav') == 'weird-name')
 grp = {rid(w) for w in CLIPS}
 check('real dataset still groups into 28 recordings', len(grp) == 28, f'{len(grp)} groups')
-# ATTRIBUTION: under the old positional parse the two layouts do not even agree on a
-# key -- a Cell 8 clip falls back to its own file name, i.e. one group per clip, which on a
-# re-extracted dataset would be 964 groups and a leakage check that reports a false all-clear.
-_old_keys = {(lambda p: p[:-4].split('_')[3] if len(p[:-4].split('_')) >= 6 else p)(f)
-             for f in (six, four)}
-check('ATTRIBUTION: the old parse puts a Cell 8 clip in its own group',
-      len(_old_keys) == 2 and four in _old_keys, f'{sorted(_old_keys)}')
+# Under the old positional parse a Cell 8 clip falls back to its own file name, i.e. one group per
+# clip, so on a re-extracted dataset every clip is its own "recording" and the leakage check
+# reports a false all-clear. A CONTRAST on that outcome, so the check depends on the artifact:
+# what the old parse did to the group count, AND that the notebook does not do it. Measured on
+# Cell 8-style output, because the positional parse works fine on the 6-field names.
+_old = lambda p: (p[:-4].split('_')[3] if len(p[:-4].split('_')) >= 6 else p)
+_c8a, _c8b = 'sasa-bat_20260429-192000_215755_215781.wav', 'sasa-bat_20260429-192000_999999_999999.wav'
+check('on Cell 8 output the old parse gives one group per clip; the notebook does not',
+      len({_old(_c8a), _old(_c8b)}) == 2 and len({rid(_c8a), rid(_c8b)}) == 1,
+      f'old 2 groups / 2 clips vs notebook {len(grp)} groups on the real dataset')
 
 # =========================================================================================
 # B5 -- run the summary cell and inspect the table it prints
@@ -145,24 +148,34 @@ check('table shows an n (denominator) column', '"n":>4' in summary_src
       and '|n:' not in tail and 'n  ' in tail)
 check('table shows a Note/kind column', 'Note' in tail)
 check('the signal-free row is marked NO SIGNAL', 'NO SIGNAL' in tail)
-# Must match a TABLE ROW, not the whole tail: the banner line above the table also contains
-# "call vs noise", so a substring test over `tail` passes even when the Note column has lost
-# the kind text entirely.
-# Every official row, whatever its denominator -- filtering on 145 would silently skip the
-# reduced-denominator row that the check below is meant to hold to account.
-_rows = [ln for ln in tail.split('\n') if ln.strip().startswith('official')]
-# Each row must carry ITS OWN kind in the Note column, so compare against the fixture's
-# per-row kind rather than a single phrase. Matching a fixed phrase would also be satisfied by
-# the banner above the table, which mentions "call vs noise" regardless of the Note column.
-# Match rows to fixture entries by the tag the table prints, i.e. name minus ".pk" -- comparing
-# the full `name` would match nothing and make `all(...)` vacuously true over an empty set.
-_tags = {r['name'].replace('.pk', ''): r['kind'] for r in val_results}
-_matched = [(ln, next((_tags[t] for t in _tags if t in ln), None)) for ln in _rows]
-_missing_kind = [ln.strip()[:44] for ln, k in _matched if k is None or k not in ln]
-_kinds_ok = len(_matched) == len(val_results) and not _missing_kind
+# Each official row must carry ITS OWN kind in the Note column. Three things this must not do:
+#  * match the banner above the table, which mentions "call vs noise" regardless of the column;
+#  * key on `name`, because Space Bunny's cell takes the label from `model_tags` instead;
+#  * count the aggregate gain line, which also starts with "official".
+# So a row is located by the identifier the cell actually prints -- the `model_tags` value, or
+# the name minus ".pk" for the cell that predates that dict -- and the gain line matches neither.
+_table_lines = tail.split('\n')
+_ident = [(ns18['model_tags'].get(r['path'], ''), r['name'].replace('.pk', ''), r)
+          for r in val_results]
+
+
+def _row_for(tag, name):
+    return next((ln for ln in _table_lines if (tag and tag in ln) or name in ln), None)
+
+
+_matched = [(r, _row_for(tag, name)) for tag, name, r in _ident]
+_no_row = [name for (_tag, name, _r), (_m, ln) in zip(_ident, _matched) if ln is None]
+_no_kind = [name for (_tag, name, r), (_m, ln) in zip(_ident, _matched)
+            if ln is not None and r['kind'] not in ln]
+_kinds_ok = not _no_row and not _no_kind
+_detail = []
+if _no_row:
+    _detail.append(f'no printed row for {_no_row}')
+if _no_kind:
+    _detail.append(f'kind missing from {_no_kind}')
 check('each table row carries its own kind text in the Note column', _kinds_ok,
-      f'{len(_matched)}/{len(val_results)} rows; kind missing from {_missing_kind}'
-      if _missing_kind else f'{len(_matched)}/{len(val_results)} rows')
+      '; '.join(_detail) if _detail
+      else f'{len(_matched)}/{len(val_results)} rows, each with its kind')
 check('no doubled "official official_"', 'official official_' not in tail)
 check('balanced accuracy is quoted as the fair comparison',
       'BALANCED ACCURACY (the fair comparison)' in tail)

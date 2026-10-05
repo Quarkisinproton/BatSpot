@@ -203,7 +203,7 @@ def cell_defs(path: str, names, ns: dict) -> dict:
                            f'(it has: {sorted(available)[:12]})')
     # Resolve a node's own dependencies BEFORE exec'ing it: `_TAPE_RE = re.compile(...)` needs
     # the cell's `import re` to have run first, or it raises NameError at the assignment.
-    done = set()
+    done, pulled = set(), []
 
     def pull(name):
         if name in done:
@@ -215,28 +215,35 @@ def cell_defs(path: str, names, ns: dict) -> dict:
         for dep in sorted(_free_names(node)):
             if dep not in ns:
                 pull(dep)
+        pulled.append(node)
         exec(compile(ast.Module(body=[node], type_ignores=[]), path, 'exec'), ns)
 
     for name in wanted:
         pull(name)
 
-    # Everything a requested definition reads must now be bound -- by the cell, or by the
-    # caller. Anything still missing would raise NameError at the first call, i.e. part-way
-    # through a suite, after it has already reported some checks. Naming it here turns that
-    # into one diagnosable error at extraction time.
+    # Everything a pulled definition reads must now be bound -- by the cell, or by the caller.
+    # This walks every node that was actually exec'd, not only the requested names: a helper
+    # pulled in transitively can read something neither the cell nor the caller supplies, and
+    # that would otherwise surface as a NameError at the first call, part-way through a suite
+    # that has already printed some checks. Naming it here turns that into one error at
+    # extraction time.
     unresolved = set()
-    for name in wanted:
-        for dep in _free_names(available[name]):
-            if dep not in ns:
-                unresolved.add(dep)
+    for node in pulled:
+        unresolved |= {dep for dep in _free_names(node) if dep not in ns}
     if unresolved:
-        raise KeyError(f'{os.path.basename(path)}: {sorted(wanted)} read '
+        raise KeyError(f'{os.path.basename(path)}: pulling {sorted(wanted)} needs '
                        f'{sorted(unresolved)}, which the cell neither defines nor is given')
     return ns
 
 
 def cell_method(path: str, cls_name: str, meth_name: str, ns: dict):
-    """Exec one method out of a cell's class body; return the function."""
+    """Exec one method out of a cell's class body; return the function.
+
+    The method's free names are NOT chased: it is exec'd into the namespace the caller supplies
+    (typically the one `cell_defs` built), so it sees the same imports and helpers the rest of
+    the cell would have. A method reading something absent from `ns` raises NameError when it is
+    called, which is why a suite should call this inside the same guard as `cell_defs`.
+    """
     for node in ast.parse(open(path, encoding='utf-8').read()).body:
         if isinstance(node, ast.ClassDef) and node.name == cls_name:
             for sub in node.body:

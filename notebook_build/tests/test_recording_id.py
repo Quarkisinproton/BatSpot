@@ -36,7 +36,9 @@ def check(n, c, d=''):
         fails.append(n)
 
 
-# ---- reference implementations, for ATTRIBUTION only (never asserted as "the" behaviour) ----
+# ---- reference implementations of the PRE-FIX code. Used only to say what the bug did; ----
+# ---- every check below contrasts them against the notebook's own recording_id, so it is   ----
+# ---- an assertion about the artifact rather than about this file.                      ----
 def old_rid(path):
     """The pre-fix positional parse."""
     parts = os.path.basename(path)[:-4].split('_')
@@ -95,10 +97,16 @@ print('\n=== 2. Cell 8 layout, real filenames ===')
 c8 = cell8_name('acsh_devon_20260521_204000', 'acsh')
 check('notebook extracts the session stamp from Cell 8 output',
       rid(c8) == '20260521-204000', rid(c8))
-check('ATTRIBUTION: the old positional parse returns the SPECIES name here, merging tapes',
-      old_rid(c8) == 'acsh', f'old -> {old_rid(c8)!r}')
-check('ATTRIBUTION: my first (hyphen-only) fix fell back to the stem, one group per clip',
-      first_fix_rid(c8) == c8[:-4])
+# Each contrast below says what the old code produced AND that the notebook produces something
+# NEITHER of the two old behaviours did -- not merely "different". Asserting only `old_rid(c8) ==
+# 'acsh'` would pass whatever the notebook does, including returning 'acsh' itself.
+check('the old positional parse returns the SPECIES name; the notebook returns neither that '
+      'nor the stem',
+      old_rid(c8) == 'acsh' and rid(c8) not in ('acsh', c8[:-4]),
+      f'old -> {old_rid(c8)!r}, first fix -> {first_fix_rid(c8)!r}, notebook -> {rid(c8)!r}')
+check('the first (hyphen-only) fix fell back to the stem; the notebook does not',
+      first_fix_rid(c8) == c8[:-4] and rid(c8) != c8[:-4],
+      f'first fix -> {first_fix_rid(c8)!r} vs notebook -> {rid(c8)!r}')
 check('the notebook agrees with the separator-agnostic reference on every real name',
       all(rid(cell8_name(s, os.path.basename(os.path.dirname(s))))
           == re.sub(r'[-_]', '-', re.search(r'(\d{8})[-_](\d{6})',
@@ -111,15 +119,27 @@ n_ok = sum(rid(cell8_name(s, os.path.basename(os.path.dirname(s))))
            for s in sels)
 check(f'all {len(sels)} Cell 8 outputs resolve to a tape id', n_ok == len(sels),
       f'{n_ok}/{len(sels)}')
-old_keys = {}
+old_keys, nb_keys = {}, {}
 for s in sels:
-    old_keys.setdefault(old_rid(cell8_name(s, os.path.basename(os.path.dirname(s)))),
-                        set()).add(os.path.basename(s)[:-4])
-check(f'ATTRIBUTION: old code collapses {len(sels)} sessions into {len(old_keys)} groups',
-      len(old_keys) == 8, f'keys={sorted(old_keys)}')
-check('ATTRIBUTION: worst case merges 10 tapes into one group',
-      max(len(v) for v in old_keys.values()) == 10,
-      f'max={max(len(v) for v in old_keys.values())}')
+    _n = cell8_name(s, os.path.basename(os.path.dirname(s)))
+    old_keys.setdefault(old_rid(_n), set()).add(os.path.basename(s)[:-4])
+    nb_keys.setdefault(rid(_n), set()).add(os.path.basename(s)[:-4])
+check(f'the old code collapses {len(sels)} sessions into {len(old_keys)} groups; the '
+      f'notebook keeps them apart',
+      len(old_keys) == 8 and len(nb_keys) > len(old_keys),
+      f'old {len(old_keys)} groups vs notebook {len(nb_keys)}')
+# The pre-fix parse keys on the SPECIES, so every species becomes one group. That is a strictly
+# stronger statement than "fewer groups": it names the collapse the bug actually caused.
+check('the old parse keys on the species, merging every tape of a species; the notebook '
+      'separates them',
+      set(old_keys) == {os.path.basename(os.path.dirname(s)) for s in sels}
+      and len(nb_keys) == 28,
+      f'old keys={sorted(old_keys)} vs notebook {len(nb_keys)} groups')
+_worst = max(len(v) for v in old_keys.values())
+_worst_nb = max(len(v) for v in nb_keys.values())
+check(f'the worst old group merges {_worst} tapes; the notebook merges at most {_worst_nb}',
+      _worst == 10 and _worst_nb < _worst,
+      f'old max={_worst}, notebook max={_worst_nb}')
 
 print('\n=== 4. one tape, several species and both layouts -> ONE key ===')
 a = 'acsh-bat_1653604_2026_20260521-204000_130273_130648.wav'
