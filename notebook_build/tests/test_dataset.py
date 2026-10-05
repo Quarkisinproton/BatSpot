@@ -12,8 +12,10 @@ by reading a second, un-fixed notebook: there is no un-fixed notebook left in th
 Run: venv/bin/python notebook_build/tests/test_dataset.py   (~40 s: builds real spectrograms)
 """
 import atexit
+import contextlib
 import glob
 import hashlib
+import io
 import os
 import re
 import shutil
@@ -73,8 +75,8 @@ atexit.register(_DEVNULL.close)
 
 
 def _quiet_tqdm(it, **kw):
-    """The cell's cache loop drives tqdm; a progress bar is noise in a test log, and the
-    cache-reuse assertion reads the cell's own stdout lines, not the bar."""
+    """The cell's cache loop drives tqdm. A progress bar is noise in a test log, and the
+    cache-reuse assertion reads the cell's stdout lines, which are captured separately."""
     return tqdm(it, **{**kw, 'file': _DEVNULL})
 
 
@@ -121,9 +123,21 @@ check('cache filename carries a directory tag',
 check('cache version tag is derived from the front-end source, not hand-written',
       bool(re.fullmatch(r'v2-[0-9a-f]{6}', DS._CACHE_VERSION)), DS._CACHE_VERSION)
 
-DS(CLIPS, DET_MAP, CFG, train=True)   # second construction: must reuse, not re-convert
-check('second construction reuses the cache (no re-conversion printed above)',
-      len(glob.glob(os.path.join(WD, 'spec_cache', '*', '*.npy'))) == len(CLIPS))
+# Cache REUSE. The .npy count is unchanged whether the cell re-converts into the same
+# cache_dir or not, so counting files proves nothing. Two things do distinguish the two: the
+# cell's own "caching N clips" line, and the mtimes of the entries (a rebuild rewrites them).
+_mtimes_before = {f: os.stat(d_train._spec_path(f)).st_mtime_ns for f in CLIPS}
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    DS(CLIPS, DET_MAP, CFG, train=True)
+_reuse_out = _buf.getvalue()
+check('second construction reuses the cache (the cell prints no "caching" line)',
+      'caching' not in _reuse_out,
+      f'cell said: {_reuse_out.strip()[:80]!r}' if _reuse_out.strip() else 'silent')
+check('reusing the cache does not rewrite the entries',
+      all(os.stat(d_train._spec_path(f)).st_mtime_ns == _mtimes_before[f] for f in CLIPS),
+      f'{sum(os.stat(d_train._spec_path(f)).st_mtime_ns != _mtimes_before[f] for f in CLIPS)} '
+      f'of {len(CLIPS)} rewritten')
 
 # --- the stale-cache bug: touch a wav and confirm the entry is rebuilt -----------------------
 # Run on a private copy, so the suite never mutates the mtime of a file in Data/.
@@ -132,9 +146,12 @@ os.makedirs(_probe, exist_ok=True)
 victim = os.path.join(_probe, os.path.basename(CLIPS[0]))
 shutil.copy(CLIPS[0], victim)
 DS([victim], map_for([victim]), CFG, train=True)
-before = os.stat(DS([victim], map_for([victim]), CFG, train=True)._spec_path(victim)).st_mtime_ns
-os.utime(victim, ns=(os.stat(victim).st_mtime_ns, os.stat(victim).st_mtime_ns + 10_000_000))
-after = os.stat(DS([victim], map_for([victim]), CFG, train=True)._spec_path(victim)).st_mtime_ns
+_entry = DS([victim], map_for([victim]), CFG, train=True)._spec_path(victim)
+before = os.stat(_entry).st_mtime_ns
+_wav = os.stat(victim).st_mtime_ns
+os.utime(victim, ns=(_wav, _wav + 10_000_000))
+DS([victim], map_for([victim]), CFG, train=True)
+after = os.stat(_entry).st_mtime_ns
 check('touching a wav INVALIDATES its cache entry (stale-cache bug fixed)', after != before,
       f'{before} -> {after}')
 

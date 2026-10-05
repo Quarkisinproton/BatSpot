@@ -106,13 +106,17 @@ check('prior shift factor ~4.2 in odds (matches the reported diagnosis)',
 cp = nn.get('CLS_EVAL_PRIOR')
 check('classifier eval prior sums to 1', cp is not None and abs(cp.sum() - 1.0) < 1e-9,
       'CLS_EVAL_PRIOR missing from the cell' if cp is None else f'sum={cp.sum():.9f}')
-cmap = nn.get('CLS_CLASS_TO_IDX', {})
+cmap = nn.get('CLS_CLASS_TO_IDX')
+_want = [('acsh', 24 / 145), ('alte', 27 / 145), ('noise', 28 / 145), ('rhro', 14 / 145)]
+_missing = [c for c, _ in _want if not cmap or c not in cmap]
 check('classifier prior matches the reported test distribution',
-      cp is not None and all(abs(cp[cmap[c]] - v) < 1e-9 for c, v in
-                             [('acsh', 24 / 145), ('alte', 27 / 145),
-                              ('noise', 28 / 145), ('rhro', 14 / 145)]),
-      'needs CLS_EVAL_PRIOR and CLS_CLASS_TO_IDX' if cp is None else 'mismatch')
-check('CLS_CLASS_TO_IDX covers all 8 species', len(cmap) == 8, f'{len(cmap)} entries')
+      cp is not None and not _missing
+      and all(abs(cp[cmap[c]] - v) < 1e-9 for c, v in _want),
+      'CLS_EVAL_PRIOR missing from the cell' if cp is None
+      else f'CLS_CLASS_TO_IDX lacks {_missing}' if _missing else 'mismatch')
+check('CLS_CLASS_TO_IDX covers all 8 species',
+      cmap is not None and len(cmap) == 8,
+      'CLS_CLASS_TO_IDX missing from the cell' if cmap is None else f'{len(cmap)} entries')
 check('CLS_CONFIG num_classes still auto-set to 8', nn['CLS_CONFIG']['num_classes'] == 8,
       str(nn['CLS_CONFIG']['num_classes']))
 check('dead DET_CLASS_TO_IDX no longer defined', 'DET_CLASS_TO_IDX' not in nn,

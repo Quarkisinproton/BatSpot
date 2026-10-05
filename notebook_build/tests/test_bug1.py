@@ -15,7 +15,6 @@ save_path modes and requires them to agree -- which is the same defect seen from
 
 Run: venv/bin/python notebook_build/tests/test_bug1.py
 """
-import ast
 import atexit
 import os
 import shutil
@@ -84,8 +83,27 @@ def make_model():
     return nn.Sequential(nn.Linear(DIM, 32), nn.ReLU(), nn.Linear(32, N_CLASS))
 
 
+def predict_proba(model, dataset, device, batch_size=256):
+    """Stand-in for the real clip-level scorer, which needs the full spectrogram front end.
+
+    The synthetic FakeDS holds tensors, not audio, so this is the minimal contract train_model
+    needs: (probs, labels) over the dataset's items.
+    """
+    model.eval()
+    with torch.no_grad():
+        out = torch.softmax(model(dataset.x), dim=1).numpy()
+    return out, dataset.y.numpy()
+
+
 def load_train_model(path):
-    """Exec the cell's train_model with the globals it expects."""
+    """Exec the cell's train_model with the globals it expects.
+
+    Only `train_model` is requested: cell_defs pulls in `make_weighted_sampler`,
+    `compute_class_weights` and anything else it reads, by closure analysis. An earlier version
+    whitelisted those three names by hand, which worked only because the cell happened to
+    define exactly those; one added helper would have been a NameError deep inside a 30-epoch
+    training run.
+    """
     ns = dict(np=np, torch=torch, nn=nn, optim=optim, os=os, plt=plt, Counter=Counter, ceil=ceil,
               Dataset=Dataset, DataLoader=DataLoader,
               WeightedRandomSampler=WeightedRandomSampler,
@@ -93,20 +111,9 @@ def load_train_model(path):
               balanced_accuracy_score=balanced_accuracy_score,
               get_class_from_filename=get_class_from_filename,
               SELECT_METRIC='balanced_accuracy', REPORT_TOPK_MEAN=3,
-              tqdm=lambda x, **k: x)
-    src = open(path, encoding='utf-8').read()
-    for node in ast.parse(src).body:
-        if isinstance(node, ast.FunctionDef) and node.name in (
-                'compute_class_weights', 'make_weighted_sampler', 'train_model'):
-            exec(compile(ast.Module(body=[node], type_ignores=[]), path, 'exec'), ns)
-
-    def predict_proba(model, dataset, device, batch_size=256):
-        model.eval()
-        with torch.no_grad():
-            out = torch.softmax(model(dataset.x), dim=1).numpy()
-        return out, dataset.y.numpy()
-    ns['predict_proba'] = predict_proba
-    return ns['train_model']
+              tqdm=lambda x, **k: x,
+              predict_proba=predict_proba)
+    return extract_cells.cell_defs(path, {'train_model'}, ns)['train_model']
 
 
 def rescore(model, val):

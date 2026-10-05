@@ -22,8 +22,18 @@ re-runs the matching suite against the mutant.
 Cell indices are the notebook's own, so a suite names the cell it is testing
 (`CELL_CONFIG`, `CELL_DATASET`, ...) rather than a filename that a reordering
 would silently invalidate.
+
+`cell_defs()` isolates individual definitions out of a cell for suites that
+cannot exec the whole thing (the data-discovery cell globs paths and prints; the
+training cell needs a stubbed `predict_proba`). It pulls in every module-level
+binding the requested functions actually reference, by closure analysis, so it
+does not depend on the names a cell happens to use today -- base cell 6 spells
+its regex constant `_TAPE_RE`, Space Bunny's `_TS_RE` behind `import re as _re`,
+and both must work.
 """
+import ast
 import atexit
+import builtins
 import json
 import os
 import re
@@ -74,10 +84,14 @@ def extract(notebook_path: str, out_dir: str) -> dict:
     return written
 
 
-def dir_map(out_dir: str) -> dict:
-    """Map an already-extracted directory back to {index: path}, ignoring anything else."""
+def dir_map(out_dir: str, caller: str = 'extracted cells') -> dict:
+    """Map an already-extracted directory back to {index: path}, ignoring anything else.
+
+    `caller` names who is asking, so the message stays accurate: `dir_map` is a general
+    helper and `NEW_CELLS` is only one of its callers.
+    """
     if not os.path.isdir(out_dir):
-        raise NotADirectoryError(f'NEW_CELLS={out_dir!r} is not a directory')
+        raise NotADirectoryError(f'{caller}: {out_dir!r} is not a directory')
     found = {}
     for name in sorted(os.listdir(out_dir)):
         stem, ext = os.path.splitext(name)
@@ -85,7 +99,7 @@ def dir_map(out_dir: str) -> dict:
         if m and ext in ('.py', '.md'):
             found[int(m.group(2))] = os.path.join(out_dir, name)
     if not found:
-        raise FileNotFoundError(f'no src_NN.py / md_NN.md files in {out_dir}')
+        raise FileNotFoundError(f'{caller}: no src_NN.py / md_NN.md files in {out_dir}')
     return found
 
 
@@ -100,7 +114,7 @@ def merged_cells() -> dict:
     """Cells of the artifact under test (or of NEW_CELLS, when redgreen.py sets it)."""
     override = os.environ.get('NEW_CELLS')
     if override:
-        return dir_map(override)
+        return dir_map(override, 'NEW_CELLS')
     if not os.path.exists(MERGED):
         raise FileNotFoundError(f'{MERGED} does not exist; run notebook_build/assemble.py')
     return _cells_of(MERGED)
@@ -109,3 +123,126 @@ def merged_cells() -> dict:
 def base_cells() -> dict:
     """Cells of the read-only base parent, for attribution only."""
     return _cells_of(BASE)
+
+
+# --- isolating individual definitions out of a cell -----------------------------------------
+#
+# A suite that wants one function cannot always exec the whole cell: the data-discovery cell
+# globs DATA_DIR and prints a split report, the training cell needs a stubbed `predict_proba`.
+# These helpers pull out just the requested definitions -- and, by closure analysis, every
+# module-level binding they reference.
+
+def _bound_names(node: ast.AST) -> set:
+    """Names a definition binds locally: params, assignments, nested defs, imports, loop vars.
+
+    Correctly identifies *free* variables for the purpose of pulling in module-level
+    dependencies. Deliberately over-approximates -- a name bound anywhere in the function is
+    treated as local even if some loads precede the binding -- because under-approximating
+    would make the analysis report a false dependency, which is the failure that bites.
+    """
+    bound = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name) and isinstance(sub.ctx, (ast.Store, ast.Del)):
+            bound.add(sub.id)
+        elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(sub.name)
+        elif isinstance(sub, ast.arg):
+            bound.add(sub.arg)
+        elif isinstance(sub, ast.ExceptHandler) and sub.name:
+            bound.add(sub.name)
+        elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+            for alias in sub.names:
+                bound.add((alias.asname or alias.name).split('.')[0])
+    return bound
+
+
+def _free_names(node: ast.AST) -> set:
+    """Names a definition reads but does not bind; builtins and locals excluded."""
+    loaded = {n.id for n in ast.walk(node)
+              if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    return loaded - _bound_names(node) - set(dir(builtins))
+
+
+def _top_level_bindings(body) -> dict:
+    """Map every name bound at a cell's top level to the statement that binds it."""
+    binds = {}
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            binds[node.name] = node
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                binds.setdefault((alias.asname or alias.name).split('.')[0], node)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in targets:
+                for n in ast.walk(t):
+                    if isinstance(n, ast.Name):
+                        binds.setdefault(n.id, node)
+    return binds
+
+
+def cell_defs(path: str, names, ns: dict) -> dict:
+    """Exec the named top-level definitions out of a cell, plus what they reference.
+
+    `names` are the definitions the caller wants (e.g. `{'recording_id'}`). Everything they
+    read at module level -- a regex constant, an `import x as y`, a helper function -- is
+    pulled in transitively, so this keeps working when a port renames a private helper.
+    Caller-supplied `ns` wins over the cell's own binding for any name present in both, which
+    is how a suite substitutes a stub for something it cannot run.
+
+    Returns `ns` with the requested definitions present. A name that cannot be found raises
+    KeyError naming what was missing, rather than failing later as a NameError deep inside a
+    call that happens to be the first thing the suite exercises.
+    """
+    body = ast.parse(open(path, encoding='utf-8').read()).body
+    available = _top_level_bindings(body)
+    wanted = list(names)
+    for name in wanted:
+        if name not in available:
+            raise KeyError(f'{os.path.basename(path)} defines no top-level {name!r} '
+                           f'(it has: {sorted(available)[:12]})')
+    # Resolve a node's own dependencies BEFORE exec'ing it: `_TAPE_RE = re.compile(...)` needs
+    # the cell's `import re` to have run first, or it raises NameError at the assignment.
+    done = set()
+
+    def pull(name):
+        if name in done:
+            return
+        done.add(name)
+        node = available.get(name)
+        if node is None:
+            return                      # supplied by the caller, or genuinely absent (a global)
+        for dep in sorted(_free_names(node)):
+            if dep not in ns:
+                pull(dep)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), path, 'exec'), ns)
+
+    for name in wanted:
+        pull(name)
+
+    # Everything a requested definition reads must now be bound -- by the cell, or by the
+    # caller. Anything still missing would raise NameError at the first call, i.e. part-way
+    # through a suite, after it has already reported some checks. Naming it here turns that
+    # into one diagnosable error at extraction time.
+    unresolved = set()
+    for name in wanted:
+        for dep in _free_names(available[name]):
+            if dep not in ns:
+                unresolved.add(dep)
+    if unresolved:
+        raise KeyError(f'{os.path.basename(path)}: {sorted(wanted)} read '
+                       f'{sorted(unresolved)}, which the cell neither defines nor is given')
+    return ns
+
+
+def cell_method(path: str, cls_name: str, meth_name: str, ns: dict):
+    """Exec one method out of a cell's class body; return the function."""
+    for node in ast.parse(open(path, encoding='utf-8').read()).body:
+        if isinstance(node, ast.ClassDef) and node.name == cls_name:
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and sub.name == meth_name:
+                    sub.decorator_list = []
+                    exec(compile(ast.Module(body=[sub], type_ignores=[]), path, 'exec'), ns)
+                    return ns[meth_name]
+    raise KeyError(f'{os.path.basename(path)} has no {cls_name}.{meth_name}')

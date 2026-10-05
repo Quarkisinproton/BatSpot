@@ -145,7 +145,24 @@ check('table shows an n (denominator) column', '"n":>4' in summary_src
       and '|n:' not in tail and 'n  ' in tail)
 check('table shows a Note/kind column', 'Note' in tail)
 check('the signal-free row is marked NO SIGNAL', 'NO SIGNAL' in tail)
-check('the kind text reaches the table row', 'call vs noise' in tail)
+# Must match a TABLE ROW, not the whole tail: the banner line above the table also contains
+# "call vs noise", so a substring test over `tail` passes even when the Note column has lost
+# the kind text entirely.
+# Every official row, whatever its denominator -- filtering on 145 would silently skip the
+# reduced-denominator row that the check below is meant to hold to account.
+_rows = [ln for ln in tail.split('\n') if ln.strip().startswith('official')]
+# Each row must carry ITS OWN kind in the Note column, so compare against the fixture's
+# per-row kind rather than a single phrase. Matching a fixed phrase would also be satisfied by
+# the banner above the table, which mentions "call vs noise" regardless of the Note column.
+# Match rows to fixture entries by the tag the table prints, i.e. name minus ".pk" -- comparing
+# the full `name` would match nothing and make `all(...)` vacuously true over an empty set.
+_tags = {r['name'].replace('.pk', ''): r['kind'] for r in val_results}
+_matched = [(ln, next((_tags[t] for t in _tags if t in ln), None)) for ln in _rows]
+_missing_kind = [ln.strip()[:44] for ln, k in _matched if k is None or k not in ln]
+_kinds_ok = len(_matched) == len(val_results) and not _missing_kind
+check('each table row carries its own kind text in the Note column', _kinds_ok,
+      f'{len(_matched)}/{len(val_results)} rows; kind missing from {_missing_kind}'
+      if _missing_kind else f'{len(_matched)}/{len(val_results)} rows')
 check('no doubled "official official_"', 'official official_' not in tail)
 check('balanced accuracy is quoted as the fair comparison',
       'BALANCED ACCURACY (the fair comparison)' in tail)

@@ -12,11 +12,9 @@ to read: a reference shows what the bug did, the notebook's own output is what i
 
 Run: venv/bin/python notebook_build/tests/test_fixes.py
 """
-import ast
 import atexit
 import glob
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -25,7 +23,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import extract_cells
 
-CELL_CONFIG, CELL_DATASET, CELL_DATA, CELL_PIPELINE = 5, 5, 6, 13
+CELL_DATASET, CELL_DATA, CELL_PIPELINE = 5, 6, 13
 
 fails = []
 
@@ -36,34 +34,15 @@ def check(name, cond, detail=''):
         fails.append(name)
 
 
-def defs(path, names, consts=()):
-    """Exec the named top-level functions (and constant assignments) out of a cell.
+def defs(path, names, **ns):
+    """Exec the named top-level definitions out of a cell.
 
     A cell cannot simply be exec'd here: they print, glob Kaggle paths and build datasets.
-    Pulling single definitions keeps the test on the artifact's code without its side effects.
+    `extract_cells.cell_defs` pulls the definitions plus, by closure analysis, every
+    module-level binding they read -- so this does not care whether a cell names its regex
+    constant `_TAPE_RE`, `_TS_RE`, or anything else.
     """
-    ns = {'np': np, 'os': os, 're': re}
-    for node in ast.parse(open(path, encoding='utf-8').read()).body:
-        if isinstance(node, ast.FunctionDef) and node.name in names:
-            exec(compile(ast.Module(body=[node], type_ignores=[]), path, 'exec'), ns)
-        elif isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id in consts for t in node.targets):
-            exec(compile(ast.Module(body=[node], type_ignores=[]), path, 'exec'), ns)
-    return ns
-
-
-def method(path, cls_name, meth_name, extra_ns=None):
-    """Exec one method out of a class body."""
-    ns = {'np': np, 'os': os}
-    if extra_ns:
-        ns.update(extra_ns)
-    for node in ast.parse(open(path, encoding='utf-8').read()).body:
-        if isinstance(node, ast.ClassDef) and node.name == cls_name:
-            for sub in node.body:
-                if isinstance(sub, ast.FunctionDef) and sub.name == meth_name:
-                    sub.decorator_list = []
-                    exec(compile(ast.Module(body=[sub], type_ignores=[]), path, 'exec'), ns)
-    return ns[meth_name]
+    return extract_cells.cell_defs(path, names, ns)
 
 
 idx = extract_cells.merged_cells()
@@ -71,7 +50,7 @@ print(f'=== under test: {os.environ.get("NEW_CELLS") or extract_cells.MERGED} ==
 
 FN = {'minmax_normalize', 'pad_window', 'window_scores', 'train_window_starts',
       'eval_window_starts'}
-fns = defs(idx[CELL_DATASET], FN)
+fns = defs(idx[CELL_DATASET], FN, np=np, os=os)
 
 # --- reference for attribution only: the pre-fix min-max/pad ORDER -------------------------
 def pad_then_minmax(win, seq_len):
@@ -113,8 +92,8 @@ np.save(HOLD, db)   # _window np.load()s this; _mmap() bypasses it
 
 
 print('\n=== FIX 2: min-max / pad ORDER (cell 5, _window) ===')
-w = method(idx[CELL_DATASET], 'WindowedBatDataset', '_window',
-           extra_ns=dict(fns))(Holder(), 0, 0)
+w = extract_cells.cell_method(idx[CELL_DATASET], 'WindowedBatDataset', '_window',
+                              dict(fns))(Holder(), 0, 0)
 w_ref = pad_then_minmax(db, SEQ)
 check('shapes match', w.shape == (SEQ, 4) == w_ref.shape, str(w.shape))
 check('a pad-first reference fills the padded region with 1.0 (silence as loudest feature)',
@@ -142,16 +121,24 @@ n = len(starts)
 tied = np.ones(n)
 k_ref = len(percentile_top(starts, tied, 0.20))
 k_new = len(fns['train_window_starts'](starts, tied, 'energy_crop', 0.20))
-check('a percentile-threshold reference selects ALL windows when the scores tie',
-      k_ref == n, f'reference kept {k_ref}/{n}')
+# Asserting only `k_ref == n` would test the local reference and nothing else. The property that
+# matters is the CONTRAST: the reference keeps every tied window and the cell does not.
+check('a percentile-threshold reference keeps ALL tied windows; the notebook does not',
+      k_ref == n and k_new != k_ref, f'reference kept {k_ref}/{n}, notebook kept {k_new}')
 check('the notebook selects exactly ceil(20%)', k_new == int(np.ceil(n * 0.20)), f'{k_new}/{n}')
 uniq = rs.uniform(0, 1, n)
 kn = len(fns['train_window_starts'](starts, uniq, 'energy_crop', 0.20))
 topk = set(starts[np.argsort(-uniq, kind='stable')[:kn]].tolist())
 check('the notebook returns the loudest k, not a threshold set',
       set(fns['train_window_starts'](starts, uniq, 'energy_crop', 0.20).tolist()) == topk)
-check('the notebook is deterministic under ties',
-      len(fns['train_window_starts'](starts, tied, 'energy_crop', 0.20)) == k_new)
+# Under ties every window is equally loud, so a rank-based stable selection must return the
+# first k in position order -- the same windows every time. Asserting only the COUNT would be
+# near-vacuous: any implementation returning n_keep values would pass.
+_tie_a = fns['train_window_starts'](starts, tied, 'energy_crop', 0.20)
+_tie_b = fns['train_window_starts'](starts, tied, 'energy_crop', 0.20)
+check('the notebook is deterministic under ties (same windows on every call)',
+      np.array_equal(_tie_a, _tie_b) and np.array_equal(_tie_a, starts[:k_new]),
+      f'{_tie_a.tolist()} vs {starts[:k_new].tolist()}')
 check('fewer than 3 windows returns all of them',
       len(fns['train_window_starts'](np.array([0, 3]), np.array([1.0, 2.0]),
                                      'energy_crop', 0.20)) == 2)
@@ -190,28 +177,48 @@ print(f'    (worst-case tied-score clips the percentile rule would keep ALL {wor
       f'{degen} of {len(allw)}, vs the notebook\'s ceil(20%) cap)')
 
 print('\n=== recording_id (cell 6) ===')
-ns7 = defs(idx[CELL_DATA], {'recording_id'}, consts={'_TAPE_RE'})
-rid = ns7['recording_id']
+# No constant name is requested: cell_defs follows what recording_id actually reads, so this
+# works whether the cell binds _TAPE_RE, _TS_RE, or imports `re as _re`. If it cannot resolve
+# them it raises here, before any check in this section has printed.
+try:
+    rid = defs(idx[CELL_DATA], {'recording_id'}, np=np, os=os)['recording_id']
+except KeyError as e:
+    rid = None
+    print(f'  (cell 6 could not be isolated: {e})')
 six = 'acsh-bat_3379376_2026_20260525-192000_91577_92135.wav'
 four = 'sasa-bat_20260429-192000_215755_215781.wav'
-check('6-field name still yields the tape id', rid(six) == '20260525-192000', rid(six))
-check('4-field name (what the clip-extraction cell writes) yields the tape id',
-      rid(four) == '20260429-192000', rid(four))
-check('two clips from one tape group together',
-      rid(four) == rid(four.replace('215755_215781', '999999_999999')))
-check('different tapes stay apart', rid(four) != rid(six))
+_NO_RID = 'recording_id not extractable from cell 6'
+if rid is None:
+    check('6-field name still yields the tape id', False, _NO_RID)
+    check('4-field name (what the clip-extraction cell writes) yields the tape id', False, _NO_RID)
+    check('two clips from one tape group together', False, _NO_RID)
+    check('different tapes stay apart', False, _NO_RID)
+else:
+    check('6-field name still yields the tape id', rid(six) == '20260525-192000', rid(six))
+    check('4-field name (what the clip-extraction cell writes) yields the tape id',
+          rid(four) == '20260429-192000', rid(four))
+    check('two clips from one tape group together',
+          rid(four) == rid(four.replace('215755_215781', '999999_999999')))
+    check('different tapes stay apart', rid(four) != rid(six))
 _old = lambda p: (os.path.basename(p)[:-4].split('_')[3]
                   if len(os.path.basename(p)[:-4].split('_')) >= 6 else os.path.basename(p))
 check('ATTRIBUTION: the positional parse was broken on 4-field names',
       _old(four) == four, '-> every clip its own group')
-grp = {rid(w) for w in allw}
-check('real dataset: 28 groups (not 964)', len(grp) == 28, f'{len(grp)} groups / {len(allw)} clips')
+grp = {rid(w) for w in allw} if rid is not None else set()
+check('real dataset: 28 groups (not 964)',
+      rid is not None and len(grp) == 28,
+      _NO_RID if rid is None else f'{len(grp)} groups / {len(allw)} clips')
 
 print('\n=== prior correction (cell 13) ===')
 # WeightedRandomSampler draws every class with probability 1/n_classes, so the detector trains
 # under a 50/50 prior against a 19/81 evaluation prior: a 4.18x shift in odds.
-pc = defs(idx[CELL_PIPELINE], {'prior_correct_probs'}).get('prior_correct_probs')
-MISSING = 'prior_correct_probs is not defined in the combined-pipeline cell'
+try:
+    pc = defs(idx[CELL_PIPELINE], {'prior_correct_probs'}, np=np, os=os).get('prior_correct_probs')
+except KeyError as e:
+    pc = None
+    MISSING = f'prior_correct_probs is not defined in the combined-pipeline cell ({e})'
+else:
+    MISSING = 'prior_correct_probs is not defined in the combined-pipeline cell'
 PE, PT = np.array([0.193, 0.807]), np.array([0.5, 0.5])
 raw = np.array([[0.5, 0.5]])
 

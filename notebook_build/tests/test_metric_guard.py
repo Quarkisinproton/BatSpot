@@ -15,6 +15,7 @@ Run: venv/bin/python notebook_build/tests/test_metric_guard.py
 """
 import ast
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -83,12 +84,23 @@ check('train_model selects the metric via a dict lookup',
 _code_only = '\n'.join(ln.split('#')[0] for ln in train_src.split('\n'))
 check('the old if/else fallback is gone from CODE (it survives only in the fix comment)',
       "SELECT_METRIC == 'balanced_accuracy'" not in _code_only)
-try:
-    {'balanced_accuracy': 1.0, 'accuracy': 1.0}['balanced_acc']
-    raised = False
-except KeyError:
-    raised = True
-check('dict lookup on an unknown key raises rather than degrading', raised)
+# The dict lookup must be exercised, not merely recognised: run the cell's OWN selection
+# expression with a typo'd metric and require a KeyError. A local dict literal would only
+# prove CPython raises, and would pass even if the cell had reverted to an if/else.
+SELECT = re.search(r"\{'balanced_accuracy':\s*\w+,\s*'accuracy':\s*\w+\}\[SELECT_METRIC\]",
+                   train_src)
+raised, detail = False, 'no {...}[SELECT_METRIC] expression found in the training cell'
+if SELECT:
+    expr = SELECT.group(0)
+    try:
+        eval(expr, {'SELECT_METRIC': 'balanced_acc'}, {'val_bal': 0.9, 'val_acc': 0.8})
+    except KeyError:
+        raised = True
+        detail = f'KeyError from {expr!r}'
+    else:
+        detail = f'{expr!r} returned instead of raising'
+check('the cell\'s own lookup expression raises KeyError on a typo, rather than degrading',
+      raised, detail)
 
 # The pre-fix suite asserted the base notebook still carried the fallback, to show the risk
 # was real. There is no un-fixed notebook left to read, so the same intent is expressed as a
