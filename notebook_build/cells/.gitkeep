@@ -1,0 +1,4 @@
+Cell sources for assemble.py. One file per notebook cell; the filename says the
+cell type (`.md` = markdown, anything else = code).
+
+Populated by the port tasks. Nothing here is read by hand — see ../README.md.
