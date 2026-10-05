@@ -24,6 +24,7 @@ import copy
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -58,6 +59,23 @@ def test_base_notebook_has_expected_shape():
     assert nb['cells'][23]['cell_type'] == 'code'
 
 
+def test_base_carries_no_saved_execution_state():
+    """Pins the 'lossless pass-through' claim made in README.md and assemble.py.
+
+    build() clears outputs/execution_count on every code cell, so if the base ever
+    gains saved outputs the pass-through is no longer lossless -- source-identical,
+    but 22 of 24 cells would differ. Nothing else notices: the staleness check
+    compares the committed artifact against a fresh, equally-stripped build. This
+    check is what turns that silent gap into a loud failure."""
+    nb = json.load(open(assemble.BASE))
+    dirty = [i for i, c in enumerate(nb['cells'])
+             if c['cell_type'] == 'code' and (c.get('outputs') or c.get('execution_count'))]
+    assert not dirty, (
+        f'base code cells {dirty} carry saved outputs/execution_count; build() strips '
+        'them, so the empty build is no longer lossless. Commit the base without '
+        'outputs (nbformat clears them on save), or drop the pass-through claim.')
+
+
 # --- the replacement machinery ------------------------------------------------------------
 
 MD_BODY = '# replaced title\n\nreplaced body line\n'
@@ -72,19 +90,27 @@ _UNSET = object()  # means "use assemble.py's current tables", so the staleness
 
 
 def build_with(replace=_UNSET, append_md=_UNSET, append_code=_UNSET, tmp=None):
-    """Run build() against a scratch cells/ dir; returns the written notebook.
+    """Run build(); returns the written notebook.
 
-    The four sample sources are written into the scratch cells/ dir but are only
-    used when a table is passed explicitly; the sentinel keeps assemble.py's own
-    REPLACE/APPEND_* in force otherwise.
+    An _UNSET table means "use assemble.py's current table". In that case CELLS
+    must stay pointed at the real notebook_build/cells/ -- redirecting it to a
+    scratch dir holding only stubs would make a build of the *real* tables read
+    stub bodies, which is what the staleness check compares against.
+
+    Passing an explicit table opts into a scratch CELLS dir seeded with the four
+    sample sources, so a ported fix can be exercised without touching cells/.
     """
-    cells_dir = os.path.join(tmp, 'cells')
-    os.makedirs(cells_dir, exist_ok=True)
-    for fname, body in [('md_00.md', MD_BODY), ('src_05.py', CODE_BODY),
-                        ('md_extra.md', 'appended markdown\n'),
-                        ('src_extra.py', "print('appended code')\n")]:
-        with open(os.path.join(cells_dir, fname), 'w', encoding='utf-8') as f:
-            f.write(body)
+    explicit = replace is not _UNSET or append_md is not _UNSET or append_code is not _UNSET
+    if explicit:
+        cells_dir = os.path.join(tmp, 'cells')
+        os.makedirs(cells_dir, exist_ok=True)
+        for fname, body in [('md_00.md', MD_BODY), ('src_05.py', CODE_BODY),
+                            ('md_extra.md', 'appended markdown\n'),
+                            ('src_extra.py', "print('appended code')\n")]:
+            with open(os.path.join(cells_dir, fname), 'w', encoding='utf-8') as f:
+                f.write(body)
+    else:
+        cells_dir = assemble.CELLS  # the real cells/
     out = os.path.join(tmp, 'out.ipynb')
 
     saved = (assemble.CELLS, assemble.REPLACE, assemble.APPEND_MD, assemble.APPEND_CODE)
@@ -131,19 +157,25 @@ def test_replacements_and_appends_land():
 
 
 def test_bad_entries_are_rejected():
+    """Guard rails must raise, never assert: `python -O` strips asserts, and a
+    stripped guard is a silent no-op. `test_guards_survive_python_O` pins that."""
+    # A missing file raises FileNotFoundError and the rest raise ValueError;
+    # either way nothing may pass silently.
     cases = [
         ('a .md source pointed at a code cell',
-         {5: 'md_extra.md'}, [], [], AssertionError, 'supplies a markdown cell'),
+         {5: 'md_extra.md'}, [], [], (ValueError,), 'supplies a markdown cell'),
         ('an out-of-range REPLACE index',
-         {99: 'src_05.py'}, [], [], AssertionError, 'outside the 24-cell base'),
+         {99: 'src_05.py'}, [], [], (ValueError,), 'outside the 24-cell base'),
+        ('a negative REPLACE index',
+         {-1: 'src_05.py'}, [], [], (ValueError,), 'outside the 24-cell base'),
         ('a missing cell source',
-         {5: 'nope.py'}, [], [], FileNotFoundError, 'nope.py'),
+         {5: 'nope.py'}, [], [], (FileNotFoundError,), 'nope.py'),
         ('a .md file listed in APPEND_CODE',
-         {}, [], ['md_extra.md'], AssertionError, 'is a .md file'),
+         {}, [], ['md_extra.md'], (ValueError,), 'is a .md file'),
         ('a base that is no longer 24 cells',
-         {}, [], [], AssertionError, 'expected 24'),
+         {}, [], [], (ValueError,), 'expected 24'),
     ]
-    for name, replace, amd, acode, exc, needle in cases:
+    for name, replace, amd, acode, allowed, needle in cases:
         with tempfile.TemporaryDirectory() as tmp:
             if name.startswith('a base'):
                 short = os.path.join(tmp, 'short.ipynb')
@@ -154,9 +186,9 @@ def test_bad_entries_are_rejected():
                 assemble.BASE = short
                 try:
                     build_with(replace, amd, acode, tmp)
-                except exc as e:
+                except allowed as e:
                     check(f'{name} is rejected', needle in str(e), str(e))
-                except Exception as e:  # wrong exception type
+                except Exception as e:
                     check(f'{name} is rejected', False, f'raised {type(e).__name__}: {e}')
                 else:
                     check(f'{name} is rejected', False, 'no error raised')
@@ -165,12 +197,41 @@ def test_bad_entries_are_rejected():
                 continue
             try:
                 build_with(replace, amd, acode, tmp)
-            except exc as e:
+            except allowed as e:
                 check(f'{name} is rejected', needle in str(e), str(e))
-            except Exception as e:  # wrong exception type
+            except Exception as e:
                 check(f'{name} is rejected', False, f'raised {type(e).__name__}: {e}')
             else:
                 check(f'{name} is rejected', False, 'no error raised')
+
+
+def test_guards_survive_python_O():
+    """`python -O` strips every `assert`, so a guard written as one is not a guard.
+
+    Runs a tiny script under -O that points BASE at a 5-cell notebook and calls
+    build(). With ValueError-based guards it must raise; if anyone converts one
+    back to `assert`, -O deletes it and the build silently succeeds."""
+    probe = (
+        'import contextlib, io, json, os, sys, tempfile\n'
+        f'sys.path.insert(0, {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))!r})\n'
+        'import assemble\n'
+        'd = tempfile.mkdtemp()\n'
+        'bad = os.path.join(d, "bad.ipynb")\n'
+        'base = json.load(open(assemble.BASE))\n'
+        'json.dump({"cells": base["cells"][:5], "metadata": {},'
+        ' "nbformat": 4, "nbformat_minor": 4}, open(bad, "w"))\n'
+        'assemble.BASE = bad\n'
+        'with contextlib.redirect_stdout(io.StringIO()):\n'
+        '    assemble.build(os.path.join(d, "out.ipynb"))\n'
+        'print("SUCCEEDED")\n'
+    )
+    r = subprocess.run([sys.executable, '-O', '-c', probe], capture_output=True, text=True)
+    check('build() still rejects a bad base under python -O',
+          r.returncode != 0 and 'SUCCEEDED' not in r.stdout,
+          f'exit={r.returncode} stdout={r.stdout.strip()[:80]!r}')
+    check('the -O rejection is a ValueError with the real diagnostic',
+          'ValueError' in r.stderr and 'expected 24' in r.stderr,
+          r.stderr.strip().splitlines()[-1][:120] if r.stderr.strip() else 'no stderr')
 
 
 def test_committed_notebook_is_not_stale():
@@ -190,8 +251,13 @@ def test_committed_notebook_is_not_stale():
           're-run notebook_build/assemble.py')
     check('the merged notebook keeps the base metadata (Kaggle accelerator settings)',
           committed['metadata'] == json.load(open(assemble.BASE))['metadata'])
-    check('the merged notebook is nbformat 4',
-          committed['nbformat'] == 4 and isinstance(committed['cells'], list))
+    base_nb = json.load(open(assemble.BASE))
+    check('the merged notebook carries the base nbformat and top-level keys',
+          (committed['nbformat'], committed['nbformat_minor'])
+          == (base_nb['nbformat'], base_nb['nbformat_minor'])
+          and set(committed) == set(base_nb),
+          f"nbformat={committed['nbformat']}.{committed['nbformat_minor']}, "
+          f"keys={sorted(committed)}")
 
 
 def test_stale_execution_state_is_stripped():
@@ -232,8 +298,10 @@ CHECKS = [
     ('to_source drops the trailing newline on the last line',
      test_to_source_trailing_newline_dropped_on_last_line),
     ('base notebook has the expected 24-cell shape', test_base_notebook_has_expected_shape),
+    ('base carries no saved execution state', test_base_carries_no_saved_execution_state),
     ('replacements and appends land, untouched cells do not', test_replacements_and_appends_land),
     ('malformed REPLACE/APPEND entries are rejected loudly', test_bad_entries_are_rejected),
+    ('guard rails survive python -O', test_guards_survive_python_O),
     ('stale outputs and execution counts are stripped', test_stale_execution_state_is_stripped),
     ('the committed merged notebook is not stale', test_committed_notebook_is_not_stale),
 ]
@@ -241,13 +309,17 @@ CHECKS = [
 
 def main():
     for name, fn in CHECKS:
+        before = len(fails)
         try:
             fn()
         except Exception as e:
             fails.append(name)
             print(f'  [FAIL] {name}  -- {type(e).__name__}: {e}')
         else:
-            print(f'  [PASS] {name}')
+            # A group that emitted its own sub-checks must not claim PASS when
+            # one of them failed -- the sub-check line is the accurate report.
+            if len(fails) == before:
+                print(f'  [PASS] {name}')
     print('\n' + '=' * 62)
     print(f'{len(fails)} failure(s)' + (': ' + ', '.join(fails) if fails else ''))
     sys.exit(1 if fails else 0)
