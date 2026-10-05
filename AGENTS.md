@@ -1443,3 +1443,15 @@ rhle 66.7/14.1/19.2, others within 2 points; overall 638/189/137; heti lands 100
 
 Next step if an unbiased new-recording estimate is needed: joint tape assignment with a rotation over tapes
 (k-fold), pooling out-of-fold predictions; expect heti / rhbe to be unscorable on a new tape.
+
+### 11.7 Under the default clip-level split the leak is also *temporal* (2026-10-05)
+
+File names carry `START_END` ms inside the recording, so clips of one tape can be compared in time (default split,
+`random_state=42`: 674 / 145 / 145). Of the 145 test clips: **96 lie within 0.5 s of a train clip of the same tape
+(93 of them of the same species)**, median gap to the nearest same-tape train clip 0.3 s (25th percentile 0.1 s), and
+**14 overlap a train clip in time** (shared audio samples; only 1 of the 14 is the same species). Val is the same
+(85 within 0.5 s, 17 overlapping). Over all clips, 77 of 27 457 same-tape pairs overlap in time. So neighbours in one
+call sequence of one tape land on both sides of the split: the leak is the bout / animal / distance, not only the
+background. Windowing does not remove it: the split is made per clip *before* windowing, so a clip's windows never
+cross parts, but windows of neighbouring clips (~0.3 s apart) are near-duplicates, and the ~x56 more training windows
+(§9.6) are therefore not ~x56 independent samples. Only a recording-level split removes this (§11.5, §11.6).
