@@ -88,43 +88,75 @@ check('train_model selects the metric via a dict lookup',
 # "SELECT_METRIC == 'balanced_accuracy'" is broader than that, and broader than the defect: the
 # training cell also compares SELECT_METRIC to pick the printout constant that turns a score gap
 # into "~how many validation clips", which decides nothing. So the scan is for the ASSIGNMENT
-# FORM -- an outermost ternary on SELECT_METRIC whose target is a validation-score name.
+# FORM -- a conditional on SELECT_METRIC under which a validation-score name is assigned.
+#
+# Both node types are handled, because the bug has two spellings and catching only the ternary
+# would be a silent hole: `x = a if C else b` is an IfExp, while `if C: x = a else: x = b` is an
+# If whose body assigns. A first version of this check handled only the IfExp.
 #
 # Narrower than a substring scan, but not weaker for this defect: reintroduce the original line
 # and `val_score` matches on both counts, while the legitimate printout arithmetic does not.
 _SCORE_TARGETS = {'val_score', 'val_acc', 'val_bal', 'best_score'}
 
 
-def score_ternaries(src):
-    """Names assigned a ternary whose test compares SELECT_METRIC."""
-    out = []
+def _test_mentions_metric(node):
+    """True if this expression's test subtree compares SELECT_METRIC to anything."""
+    return any(isinstance(c, ast.Compare)
+               and any(isinstance(x, ast.Name) and x.id == 'SELECT_METRIC'
+                       for x in ast.walk(c))
+               for c in ast.walk(node))
+
+
+def score_conditionals(src):
+    """Validation-score names assigned inside a conditional on SELECT_METRIC."""
+    out = set()
     for node in ast.walk(ast.parse(src)):
-        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.IfExp):
+        if isinstance(node, ast.If) and _test_mentions_metric(node.test):
+            scopes = [node.body, node.orelse]
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.IfExp) \
+                and _test_mentions_metric(node.value.test):
+            scopes = [[node]]
+        else:
             continue
-        test = node.value.test
-        if not any(isinstance(c, ast.Compare) and any(
-                isinstance(x, ast.Name) and x.id == 'SELECT_METRIC'
-                for x in ast.walk(c)) for c in ast.walk(test)):
-            continue
-        for t in node.targets:
-            if isinstance(t, ast.Name) and t.id in _SCORE_TARGETS:
-                out.append(t.id)
+        for scope in scopes:
+            for stmt in scope:
+                for sub in ast.walk(stmt):
+                    if isinstance(sub, ast.Assign):
+                        for t in sub.targets:
+                            if isinstance(t, ast.Name) and t.id in _SCORE_TARGETS:
+                                out.add(t.id)
     return sorted(out)
 
 
-_ternaries = score_ternaries(train_src)
-check('no validation score is chosen by an if/else on SELECT_METRIC '
-      '(it survives only in the fix comment)', not _ternaries,
-      f'ternary-assigned in {_ternaries}' if _ternaries else '0 ternary score assignments')
+# Self-test of the oracle, so "no conditional found" cannot mean "the scan does not work".
+_ORACLE_CASES = [
+    ("val_score = val_bal if SELECT_METRIC == 'balanced_accuracy' else val_acc",
+     ['val_score'], 'the original ternary'),
+    ("if SELECT_METRIC == 'accuracy':\n    val_score = val_acc\nelse:\n    val_score = val_bal",
+     ['val_score'], 'the same bug as an if/else statement'),
+    ("_clip = (x if SELECT_METRIC == 'balanced_accuracy' else y) if len(v) > 1 else None",
+     [], 'a printout constant, not a score'),
+    ("val_acc = accuracy_score(l, p)", [], 'an unconditional score'),
+]
+for _src, _want, _why in _ORACLE_CASES:
+    check(f'the conditional scan detects {_why}', score_conditionals(_src) == _want,
+          f'{score_conditionals(_src)} != {_want}')
 
-# The training cell legitimately keeps ONE comparison on SELECT_METRIC: the printout constant
-# that converts a score gap into "~how many validation clips". Name it, so a reader who meets it
-# is not left deciding whether it is the bug, and fail if a comparison appears anywhere else.
+_cond = score_conditionals(train_src)
+check('no validation score is chosen by an if/else on SELECT_METRIC, in either the ternary '
+      '(IfExp) or the statement (If) spelling', not _cond,
+      f'score assigned inside a SELECT_METRIC conditional: {_cond}' if _cond
+      else '0 score assignments under a SELECT_METRIC conditional')
+
+# The scan above is the general defence; this one pins the specific legitimate survivor, so a
+# reader who meets a comparison in the cell is not left deciding whether it is the bug. The
+# training cell keeps ONE: the printout constant that turns a score gap into "~how many
+# validation clips". Fail if a comparison appears anywhere else.
 _lines = train_src.split('\n')
 _cmp_lines = [i for i, ln in enumerate(_lines) if 'SELECT_METRIC ==' in ln]
 _offending = [i + 1 for i in _cmp_lines
               if not any('_clip' in ln for ln in _lines[max(0, i - 1):i + 2])]
-check('every SELECT_METRIC comparison in the training cell is the clip-count printout, '
+check('every SELECT_METRIC == comparison in the training cell is the clip-count printout, '
       'not a score choice', not _offending,
       f'unaccounted comparison(s) on line(s) {_offending}' if _offending
       else f'{len(_cmp_lines)} comparison(s), all the _clip printout')
