@@ -141,7 +141,7 @@ if _reported:
 # class balance altogether, which is the other half of the same defect. The shims delegate to the
 # real implementations, so the run being inspected is a real one.
 _spy = _trainfix.Spy()
-run(None, extra={'nn': _trainfix._NNShim(_spy),
+run(None, extra={'nn': _trainfix.NNShim(_spy),
                  'DataLoader': _trainfix.make_loader_spy(_spy)})
 check('the cell built its loss without class weights (observed, not read)',
       _spy.loss_kwargs is not None and _spy.loss_kwargs.get('weight') is None,

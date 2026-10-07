@@ -117,7 +117,7 @@ class Spy:
         self.loader_kwargs = None
 
 
-class _NNShim:
+class NNShim:
     """`nn` with CrossEntropyLoss recorded; every other attribute is the real one."""
 
     def __init__(self, spy):
@@ -178,7 +178,7 @@ def flat_weights(model):
 def run_trial(path, cfg, save_path=None, extra=None, verbose=False):
     """Train one trial on the synthetic problem; return a Trial.
 
-    `extra` entries are passed to `load_train_model`. Pass `{'nn': _NNShim(spy)}` and
+    `extra` entries are passed to `load_train_model`. Pass `{'nn': NNShim(spy)}` and
     `{'DataLoader': make_loader_spy(spy)}` to record how the cell built its loss and its loader.
     stdout is captured (it carries the effective LR the cell reports); `verbose` re-prints it so a
     suite's log keeps the shape an operator is used to reading.
