@@ -48,6 +48,14 @@ N_BASE_CELLS = 24
 # 6 = data discovery: the combined notebook's cell 7. Unusable-clip pre-drop BEFORE the split
 # (so detector and classifier always see the same clip list), the three split modes
 # including per_species, the per-class recording counts and the tape-lookup baseline.
+# 7 = clip extraction: the combined notebook's cell 8, the faithful port of export_clips.R.
+# THIS IS THE EXTRACTION BUG FIX. The base cell took `'_'.join(name.split('_')[:2])` --
+# `acsh_devon` for this repo's selection tables -- as the recording stamp, so the match
+# against the audio file names never held, every table was skipped and it reported
+# "Extracted 0 clips" on the dataset it was meant to rebuild. The port matches the Raven
+# YYYYMMDD_HHMMSS stamp and writes the shipped clip layout, so cell 6's recording_id
+# finds the tape. Copied verbatim: the comments recording the faithfulness to the R script
+# and its three deliberate deviations are the point of the cell.
 # 9 = model staging: the combined notebook's cell 10. The four official models are ALL
 # basenamed ANIMAL-SPOT.pk, so staging by basename collides silently -- the classifier
 # overwrites the detector and you fine-tune a "detector" from 15-class weights.
@@ -63,8 +71,8 @@ N_BASE_CELLS = 24
 # 17 = summary: the combined notebook's cell 18. kind / n_files columns, NO SIGNAL markers and
 # the reduced-denominator warning.
 REPLACE: dict[int, str] = {
-    1: 'src_01.py', 4: 'src_04.py', 5: 'src_05.py',
-    6: 'src_06.py', 9: 'src_09.py', 14: 'src_14.py', 16: 'src_16.py', 17: 'src_17.py',
+    1: 'src_01.py', 4: 'src_04.py', 5: 'src_05.py', 6: 'src_06.py', 7: 'src_07.py',
+    9: 'src_09.py', 14: 'src_14.py', 16: 'src_16.py', 17: 'src_17.py',
 }
 
 # Cells appended after the base cells, markdown first then code.
