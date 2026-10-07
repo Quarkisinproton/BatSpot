@@ -41,7 +41,11 @@ N_BASE_CELLS = 24
 # 4 = architecture: the combined notebook's cell 5, ported verbatim. The ResNet's residual
 # projection must stay spelled `shortcut` -- that is the on-disk key format of every
 # official .pk -- so src_04.py is copied, never reformatted.
-REPLACE: dict[int, str] = {1: 'src_01.py', 4: 'src_04.py'}
+# 5 = transforms + dataset: the combined notebook's cell 6, ported verbatim. Carries the
+# background-noise mixing, the _code_fingerprint cache tag and the open-set scorers, each
+# with the measurements that chose its default. Not reformatted either: the comments record
+# which constants are measured and why, which is the entire value of the port.
+REPLACE: dict[int, str] = {1: 'src_01.py', 4: 'src_04.py', 5: 'src_05.py'}
 
 # Cells appended after the base cells, markdown first then code.
 APPEND_MD: list[str] = []    # cells/, markdown

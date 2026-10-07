@@ -59,10 +59,17 @@ def check(name, cond, detail='', guarded=False):
     """
     if guarded and ENS_ERROR:
         cond, detail = False, ENS_ERROR
-    if callable(cond):
-        cond = cond()
-    if callable(detail):
-        detail = detail()
+    # A lambda that RAISES is a failing check, not a reason to abort the suite: without this
+    # a renamed _layer_output key killed the run with a KeyError after the earlier checks had
+    # printed, and nothing was reported at all. The exception becomes the FAIL detail -- and
+    # note it must NOT try to render `detail` here, since that callable raises too.
+    try:
+        if callable(cond):
+            cond = cond()
+        if callable(detail):
+            detail = detail()
+    except Exception as e:
+        cond, detail = False, f'{type(e).__name__}: {e}'
     print(f'  [{"PASS" if cond else "FAIL"}] {name}' + (f'  -- {detail}' if detail else ''))
     if not cond:
         fails.append(name)

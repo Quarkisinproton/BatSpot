@@ -117,9 +117,21 @@ print('\n=== FIX 2: min-max / pad ORDER (cell 5, _window) ===')
 # `_window` reads np/os at call time, so the method namespace must carry them even when cell_defs
 # failed and `fns` came back empty. Any failure here is recorded and reported, never raised.
 ns5 = {'np': np, 'os': os, **fns}
+# The ported cell splits the old three-line _window into a chain:
+#     _window(i, start) -> _finish(_raw_window(i, start))
+#     _raw_window -> _mmap()[start:start+seq_len] ; _finish -> pad_window(minmax_normalize(..))
+# cell_method pulls ONE method at a time, so all three are attached to Holder below. Attaching
+# only _window would test a method that can no longer run -- the chain IS the shipped behaviour,
+# so the suite follows the chain rather than the single method.
+for _meth in ('_raw_window', '_finish', '_window'):
+    try:
+        setattr(Holder, _meth,
+                extract_cells.cell_method(idx[CELL_DATASET], 'WindowedBatDataset', _meth, ns5))
+    except Exception as e:      # any extraction failure is a reportable FAIL, not a traceback
+        CELL5_ERROR = CELL5_ERROR or f'{type(e).__name__}: {e}'
+
 try:
-    w = extract_cells.cell_method(idx[CELL_DATASET], 'WindowedBatDataset', '_window',
-                                  ns5)(Holder(), 0, 0)
+    w = Holder()._window(0, 0)
     w_ref = pad_then_minmax(db, SEQ)
 except Exception as e:      # any extraction failure is a reportable FAIL, not a traceback
     w = w_ref = None
