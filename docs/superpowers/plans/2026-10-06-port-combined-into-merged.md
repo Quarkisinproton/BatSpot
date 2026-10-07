@@ -72,7 +72,7 @@ Re-deriving these would cost a day and risk reintroducing them.
 
 **Interfaces:**
 - Consumes: `/home/gb/batspot_gpu_experiments/combined_2026-10-05/cells/c01.py` as the base text.
-- Produces: `check_bands(configs: dict[str, dict]) -> None` raising `AssertionError` naming the offending config; every flag later cells read — `SEED=42`, `CLS_ENSEMBLE_SEEDS=[42,43,44]`, `UNKNOWN_DETECTION=True`, `UNKNOWN_KEEP_KNOWN=0.95`, `UNKNOWN_LABEL='unknown'`, `UNKNOWN_METHOD='maha'`, `AUC_NO_SIGNAL=0.05`, `REPORT_TOPK_MEAN=3`, `RUN_MEASURE=True`, `RUN_EXPERIMENTS=False`, `RUN_PHASE4=False`, `RUN_GROUPED_CHECK=True`, `GROUPED_MICS`, `noise_mix_prob=0.5`, `noise_mix_snr_db=(0.0,20.0)`, `label_smoothing=0.0`, `RUN_CLIP_EXTRACTION=False`, and unchanged `DET_CONFIG`/`CLS_CONFIG` bands, `WINDOW_MODE`, `WINDOW_STRIDE`, `TRAIN_TOP_FRAC`, `TEST_TOPK`, `SELECT_METRIC`, `SPLIT_BY_RECORDING`, `RECORDING_SPLIT_SCOPE`.
+- Produces: `check_bands(configs: dict[str, dict]) -> None` raising `AssertionError` naming the offending config; every flag later cells read — `SEED=42`, `CLS_ENSEMBLE_SEEDS=[42,43,44]`, `UNKNOWN_DETECTION=True`, `UNKNOWN_KEEP_KNOWN=0.95`, `UNKNOWN_LABEL='unknown'`, `UNKNOWN_METHOD='maha'`, `AUC_NO_SIGNAL=0.05`, `REPORT_TOPK_MEAN=3`, `RUN_MEASURE=True`, `RUN_EXPERIMENTS=False`, `RUN_PHASE4=False`, `RUN_GROUPED_CHECK=True`, `GROUPED_DETECTOR`, `noise_mix_prob=0.5`, `noise_mix_snr_db=(0.0,20.0)`, `label_smoothing=0.0`, `RUN_CLIP_EXTRACTION=False`, and unchanged `DET_CONFIG`/`CLS_CONFIG` bands, `WINDOW_MODE`, `WINDOW_STRIDE`, `TRAIN_TOP_FRAC`, `TEST_TOPK`, `SELECT_METRIC`, `SPLIT_BY_RECORDING`, `RECORDING_SPLIT_SCOPE`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -425,7 +425,7 @@ git commit -m "port: inference cells — polyphase resampler, phase-aligned chun
 - Test: `test_phase2.py`
 
 **Interfaces:**
-- Consumes: `c24.md`, `c25.py`, `split_by_recording_per_species` from cell 6, `RUN_GROUPED_CHECK`, `GROUPED_MICS`.
+- Consumes: `c24.md`, `c25.py`, `split_by_recording_per_species` from cell 6, `RUN_GROUPED_CHECK`, `GROUPED_DETECTOR`.
 - Produces: `grouped_results: dict | None` — in-split vs held-out side by side, per class.
 
 - [ ] **Step 1: Write the failing test**
@@ -489,7 +489,7 @@ Expected: FAIL — no `NOISE_FLOOR`
 
 - [ ] **Step 3: Implement**
 
-For the classifier, reuse the already-trained `CLS_ENSEMBLE_SEEDS` members — no retraining needed. For the **best mic** only (`GROUPED_MICS`), train one extra copy per seed and compute the sd. Print each floor as `2 × sd = X (≈ N test clips)`, using `0.5 × (1/n_pos + 1/n_neg)` for balanced accuracy.
+For the classifier, reuse the already-trained `CLS_ENSEMBLE_SEEDS` members — no retraining needed. For the **best mic** only (`GROUPED_DETECTOR`), train one extra copy per seed and compute the sd. Print each floor as `2 × sd = X (≈ N test clips)`, using `0.5 × (1/n_pos + 1/n_neg)` for balanced accuracy.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
