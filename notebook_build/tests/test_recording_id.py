@@ -18,9 +18,6 @@ import glob
 import os
 import re
 import sys
-from collections import Counter
-import numpy as np
-from sklearn.model_selection import train_test_split
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import extract_cells
@@ -62,12 +59,9 @@ REPO = extract_cells.REPO
 CLIPS = sorted(glob.glob(f'{REPO}/Data/final_dataset/data/*/*.wav'))
 gcls = lambda f: os.path.basename(f).split('-', 1)[0]
 idx = extract_cells.merged_cells()
-ns7 = {'os': os, 'np': np, 'Counter': Counter, 'train_test_split': train_test_split,
-       're': __import__('re'), 'DATA_DIR': f'{REPO}/Data/final_dataset/data',
-       'glob': glob, 'get_class_from_filename': gcls, 'SPLIT_BY_RECORDING': False,
-       'DET_CONFIG': {}, 'CLS_CONFIG': {'num_classes': None}}
-_cell = idx[CELL_DATA]
-exec(compile(open(_cell, encoding='utf-8').read(), _cell, 'exec'), ns7)
+# The cell's config globals (192/250 kHz, n_fft 256) come from extract_cells.cell6_ns, so
+# the unusable-clip pre-drop this port adds runs at the real threshold.
+ns7, _ = extract_cells.run_cell6(idx, CELL_DATA)
 rid = ns7['recording_id']          # <-- the notebook's function
 
 
@@ -81,7 +75,7 @@ def cell8_name(sel_file, species, start_ms=1234, end_ms=5678):
 sels = sorted(glob.glob(f'{REPO}/Data/selections/*/*.txt'))
 
 print(f'=== under test: {os.environ.get("NEW_CELLS") or extract_cells.MERGED} cell {CELL_DATA} '
-      f'({os.path.basename(_cell)}) ===')
+      f'({os.path.basename(idx[CELL_DATA])}) ===')
 print('=== the two real filename families ===')
 print('  Raven/manual (what Data/final_dataset/data holds):')
 print('    acsh-bat_3379376_2026_20260525-192000_91577_92135.wav')

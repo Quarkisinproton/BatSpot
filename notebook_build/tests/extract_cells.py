@@ -34,11 +34,15 @@ and both must work.
 import ast
 import atexit
 import builtins
+import contextlib
+import io
 import json
 import os
 import re
 import shutil
 import tempfile
+
+import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -234,6 +238,74 @@ def cell_defs(path: str, names, ns: dict) -> dict:
         raise KeyError(f'{os.path.basename(path)}: pulling {sorted(wanted)} needs '
                        f'{sorted(unresolved)}, which the cell neither defines nor is given')
     return ns
+
+
+def config_from_cell1(cells: dict, i: int = 1) -> dict:
+    """The DET_CONFIG / CLS_CONFIG dicts AS THE CONFIG CELL WRITES THEM.
+
+    `cells` is the {index: path} map the suites already hold (an extracted cell, possibly a
+    mutated copy under NEW_CELLS), not the notebook itself. Read out of the delivered cell by
+    exec'ing its two assignments, rather than retyped here.
+    That matters: `_MIN_CLIP_S` in the data-discovery cell is derived from these numbers and
+    decides which clips are dropped as unusable, so a suite that ran the cell against
+    hand-copied values would silently test a different threshold if the config ever changed.
+    """
+    ns = {}
+    with open(cells[i], encoding='utf-8') as f:
+        tree = ast.parse(f.read())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id in ('DET_CONFIG', 'CLS_CONFIG')
+                for t in node.targets):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), 'cell1', 'exec'), ns)
+    missing = [k for k in ('DET_CONFIG', 'CLS_CONFIG') if k not in ns]
+    if missing:
+        raise KeyError(f'cell {i} defines no {missing}')
+    ns['CLS_CONFIG'] = dict(ns['CLS_CONFIG'])
+    ns['CLS_CONFIG']['num_classes'] = None      # the discovery cell sets it from the data
+    return ns
+
+
+def cell6_ns(cells: dict, data_dir: str = None, split_by_recording: bool = False, **over):
+    """The globals the data-discovery cell reads, at the REAL config values.
+
+    A cell cannot simply be exec'd bare: it globs DATA_DIR, reads the two spectrogram
+    configs, `sf.info` every clip, and prints a split report. Three suites run this cell
+    (test_cell7, test_recording_id, test_b5_labels), so they share this builder and a cell
+    that starts reading another global fails in one place.
+
+    `cells` is passed in (not looked up) so a suite running against a mutated copy under
+    NEW_CELLS gets THAT copy's config, not the artifact's.
+    """
+    import glob as _glob
+    import re as _re
+    from collections import Counter as _Counter, defaultdict as _defaultdict
+    from sklearn.model_selection import train_test_split as _tts
+    import soundfile as _sf
+
+    cfg = config_from_cell1(cells)
+    ns = {
+        'os': os, 'np': np, 'glob': _glob, 're': _re, 'sf': _sf,
+        'Counter': _Counter, 'defaultdict': _defaultdict, 'train_test_split': _tts,
+        'DATA_DIR': data_dir or os.path.join(REPO, 'Data', 'final_dataset', 'data'),
+        'get_class_from_filename': lambda f: os.path.basename(f).split('-', 1)[0],
+        'SPLIT_BY_RECORDING': split_by_recording,
+        'RECORDING_SPLIT_SCOPE': 'per_species',
+        'DET_CONFIG': dict(cfg['DET_CONFIG']),
+        'CLS_CONFIG': dict(cfg['CLS_CONFIG']),
+    }
+    ns.update(over)
+    return ns
+
+
+def run_cell6(cells: dict, i: int, **ns_over):
+    """Exec the data-discovery cell from `cells` and return (namespace, stdout)."""
+    path = cells[i]
+    ns = cell6_ns(cells, **ns_over)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        exec(compile(open(path, encoding='utf-8').read(), path, 'exec'), ns)
+    return ns, buf.getvalue()
 
 
 def cell_method(path: str, cls_name: str, meth_name: str, ns: dict):

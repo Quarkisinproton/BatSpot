@@ -45,7 +45,22 @@ N_BASE_CELLS = 24
 # background-noise mixing, the _code_fingerprint cache tag and the open-set scorers, each
 # with the measurements that chose its default. Not reformatted either: the comments record
 # which constants are measured and why, which is the entire value of the port.
-REPLACE: dict[int, str] = {1: 'src_01.py', 4: 'src_04.py', 5: 'src_05.py'}
+# 6 = data discovery: the combined notebook's cell 7. Unusable-clip pre-drop BEFORE the split
+# (so detector and classifier always see the same clip list), the three split modes
+# including per_species, the per-class recording counts and the tape-lookup baseline.
+# 9 = model staging: the combined notebook's cell 10. The four official models are ALL
+# basenamed ANIMAL-SPOT.pk, so staging by basename collides silently -- the classifier
+# overwrites the detector and you fine-tune a "detector" from 15-class weights.
+# 14 = export: the combined notebook's cell 15. export_pk deep-copies before .cpu(), so the
+# LIVE models stay on the GPU; also writes every ensemble member and the unknown sidecar.
+# 16 = evaluation: the combined notebook's cell 17. num_mels fallback, class names indexed by
+# output width (not by sorted dict value), and the no_signal flag.
+# 17 = summary: the combined notebook's cell 18. kind / n_files columns, NO SIGNAL markers and
+# the reduced-denominator warning.
+REPLACE: dict[int, str] = {
+    1: 'src_01.py', 4: 'src_04.py', 5: 'src_05.py',
+    6: 'src_06.py', 9: 'src_09.py', 14: 'src_14.py', 16: 'src_16.py', 17: 'src_17.py',
+}
 
 # Cells appended after the base cells, markdown first then code.
 APPEND_MD: list[str] = []    # cells/, markdown

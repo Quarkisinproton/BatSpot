@@ -55,6 +55,12 @@ def exec_cell(i, ns):
     return path
 
 
+# The summary cell is exec'd through this rather than run_cell6, because it needs its own
+# (much larger) fixture -- val_results, the confusion matrices, cls_metrics -- and none of
+# cell 6's globals. Kept so a cell that stops running is a reported failure, not a traceback
+# that hides the B5 checks below.
+
+
 # =========================================================================================
 # B4 -- run the notebook's Cell 7 and call ITS recording_id
 # =========================================================================================
@@ -62,11 +68,8 @@ print('=== B4: recording_id, from the delivered data-discovery cell ===')
 CLIPS = sorted(glob.glob(f'{REPO}/Data/final_dataset/data/*/*.wav'))
 gcls = lambda f: os.path.basename(f).split('-', 1)[0]
 
-ns7 = {'os': os, 'np': np, 'Counter': Counter, 'train_test_split': train_test_split,
-       're': __import__('re'), 'DATA_DIR': f'{REPO}/Data/final_dataset/data',
-       'glob': glob, 'get_class_from_filename': gcls, 'SPLIT_BY_RECORDING': False,
-       'DET_CONFIG': {}, 'CLS_CONFIG': {'num_classes': None}}
-_cell7 = exec_cell(CELL_DATA, ns7)
+ns7, _ = extract_cells.run_cell6(idx, CELL_DATA)
+_cell7 = idx[CELL_DATA]
 rid = ns7['recording_id']          # <-- the notebook's function, not a copy
 
 six = 'acsh-bat_3379376_2026_20260525-192000_91577_92135.wav'
@@ -119,15 +122,46 @@ val_results = [
      'n_files': NS_REDUCED, 'target_names': ['noise', 'call'], 'labels': y_red,
      'preds': (p_red >= 0.5).astype(int), 'accuracy': 0.71, 'balanced_accuracy': 0.75,
      'auc': 0.86, 'confusion_matrix': np.zeros((2, 2), int)},
+    # A fourth row for the mic that WAS fine-tuned. The cell pairs an official row with a
+    # fine-tuned one by mic name to print the gain line, so without this the gain section is
+    # empty and the two gain checks below would pass on nothing (or fail for the wrong reason).
+    # Its official balanced accuracy 0.75 and fine-tuned 0.92 give a gain of +0.170, which the
+    # checks verify against the fixture rather than merely looking for a line.
+    {'name': 'official_detector_m09.pk', 'path': 'p9', 'kind': 'detector: call vs noise',
+     'n_files': NS, 'target_names': ['noise', 'call'], 'labels': y_bin,
+     'preds': (p_call_sig >= 0.5).astype(int), 'accuracy': 0.69, 'balanced_accuracy': 0.75,
+     'auc': 0.85, 'confusion_matrix': np.zeros((2, 2), int)},
 ]
+# The ported summary cell also prints a row for the fine-tuned CLASSIFIER scored as
+# noise-vs-call, read off `cls_metrics`. Without it the cell raises before printing anything,
+# so the fixture must carry it -- as the cell's own contract requires. Labels are class
+# INDICES (the cell compares them against CLS_CLASS_TO_IDX['noise']), so they must be.
+# 'noise' sits at index 2, NOT at index 1: the official 15-class .pk has it at 8 (AGENTS.md 9.1),
+# and the point is that the cell must look it up by NAME. Every other column is a near-constant
+# 0.01, so reading the wrong index (or hard-coding 1) gives P(call) ~ 0.99 for every clip --
+# the "answers call for everything" row AGENTS.md 9.2 is about.
 CLS_CLASSES = ['acsh', 'alte', 'noise']
+CLS_CLASS_TO_IDX = {c: i for i, c in enumerate(CLS_CLASSES)}
 det_results = {'m09': {'metrics': {'labels': y_bin, 'accuracy': 0.91, 'balanced_accuracy': 0.92,
                                    'probs': np.stack([1 - p_call_sig, p_call_sig], 1)}}}
+# 28 noise clips then 117 call clips, exactly like the binary fixture above. The cell derives
+# P(call) = 1 - P(noise), so P(noise) must be HIGH on the noise clips: 0.55..0.95 there and
+# 0.05..0.45 on the call clips. Getting this backwards yields a classifier at chance, which
+# would silently turn this row into another NO SIGNAL row.
+_p_cls_noise = np.concatenate([np.linspace(0.55, 0.95, 28), np.linspace(0.05, 0.45, 117)])
+_noise_col = CLS_CLASS_TO_IDX['noise']
+cls_metrics = {
+    'labels': np.array([CLS_CLASS_TO_IDX['noise']] * 28 + [CLS_CLASS_TO_IDX['acsh']] * 117),
+    'probs': np.stack([np.full(NS, 0.01), np.full(NS, 0.01), _p_cls_noise], 1),
+}
+assert _noise_col != 1, 'noise must not be at index 1, or the wrong-column read is invisible'
 ns18 = {'np': np, 'plt': plt, 'val_results': val_results, 'det_results': det_results,
-        'test_wavs': CLIPS[:NS], 'CLS_CLASSES': CLS_CLASSES, 'AUC_NO_SIGNAL': 0.05,
+        'cls_metrics': cls_metrics, 'test_wavs': CLIPS[:NS], 'CLS_CLASSES': CLS_CLASSES,
+        'CLS_CLASS_TO_IDX': CLS_CLASS_TO_IDX, 'AUC_NO_SIGNAL': 0.05,
         'roc_auc_score': roc_auc_score, 'model_tags': {'p3': 'official:detector/m03',
                                                        'pc': 'official:classifier/m09',
-                                                       'p11': 'official:detector/m11'},
+                                                       'p11': 'official:detector/m11',
+                                                       'p9': 'official:detector/m09'},
         'classification_report': classification_report,
         'confusion_matrix': confusion_matrix, 'accuracy_score': accuracy_score,
         'balanced_accuracy_score': balanced_accuracy_score}
@@ -147,26 +181,79 @@ summary_src = open(_cell17, encoding='utf-8').read()
 check('table shows an n (denominator) column', '"n":>4' in summary_src
       and '|n:' not in tail and 'n  ' in tail)
 check('table shows a Note/kind column', 'Note' in tail)
-check('the signal-free row is marked NO SIGNAL', 'NO SIGNAL' in tail)
+
+# --- locating a printed row -----------------------------------------------------------------
 # Each official row must carry ITS OWN kind in the Note column. Three things this must not do:
 #  * match the banner above the table, which mentions "call vs noise" regardless of the column;
 #  * key on `name`, because Space Bunny's cell takes the label from `model_tags` instead;
 #  * count the aggregate gain line, which also starts with "official".
-# So a row is located by the identifier the cell actually prints -- the `model_tags` value, or
-# the name minus ".pk" for the cell that predates that dict -- and the gain line matches neither.
+# So a row is located by the identifier the cell actually prints, and the gain line matches
+# neither. Two details of the ported cell's label have to be honoured, or the locator finds
+# nothing and a check below fails for the wrong reason:
+#  * it prints `official detector_m03` -- one underscore turned into a space -- which is the
+#    B5 fix (the pre-fix cell prepended "official " to a name already starting "official_",
+#    printing "official official_detector_m03"). Matching the raw name would never locate a row;
+#  * a row flagged no_signal gets the NO SIGNAL note INSTEAD of its kind. That is the intended
+#    reading (the point of the row is that its number means nothing), so such a row counts as
+#    labelled if it carries NO SIGNAL.
 _table_lines = tail.split('\n')
-_ident = [(ns18['model_tags'].get(r['path'], ''), r['name'].replace('.pk', ''), r)
-          for r in val_results]
+
+
+def _labels(tag, name):
+    """Every spelling of this row's label the cell might print, for locating it."""
+    return [s for s in (tag, name, name.replace('_', ' ', 1)) if s]
 
 
 def _row_for(tag, name):
-    return next((ln for ln in _table_lines if (tag and tag in ln) or name in ln), None)
+    return next((ln for ln in _table_lines
+                 if any(s in ln for s in _labels(tag, name))), None)
+
+
+def _row_of(r):
+    return _row_for(ns18['model_tags'].get(r['path'], ''), r['name'].replace('.pk', ''))
+
+
+# The NO SIGNAL marker must be ON the signal-free row, not anywhere in the section. The dead
+# row is located the same way the kind check locates rows, and its marker asserted there; the
+# three informative detectors are checked NOT to carry it. Asserting only "'NO SIGNAL' in tail"
+# would pass if the marker were printed on any row at all, or in the legend.
+_dead = next(r for r in val_results if r.get('no_signal'))
+_dead_row = _row_of(_dead)
+check('the signal-free row itself is marked NO SIGNAL',
+      _dead_row is not None and 'NO SIGNAL' in _dead_row,
+      (_dead_row or 'row not found').strip())
+_live_rows = [_row_of(r) for r in val_results if not r.get('no_signal')]
+check('no informative row is marked NO SIGNAL',
+      all(ln is not None and 'NO SIGNAL' not in ln for ln in _live_rows),
+      str([ln.strip()[:60] for ln in _live_rows if ln and 'NO SIGNAL' in ln]))
+
+# The fine-tuned CLASSIFIER row is new in the ported cell (the base cell had no such line),
+# and the pre-fix report showed its noise-vs-call accuracy with no denominator or note. It
+# must be present, on the full split, and marked as a classifier -- not as a detector.
+_cls_row = next((ln for ln in _table_lines if 'fine-tuned classifier' in ln), None)
+check('the fine-tuned classifier has its own call-vs-noise row',
+      _cls_row is not None and f'{NS:>4}' in _cls_row,
+      (_cls_row or 'row not found').strip())
+check('that row is labelled as a classifier, not a detector',
+      _cls_row is not None and 'classifier as noise-vs-call' in _cls_row
+      and 'detector' not in _cls_row, (_cls_row or 'row not found').strip())
+# And the numbers on it must be the fixture's. The cell derives P(call) = 1 - P(noise) using
+# CLS_CLASS_TO_IDX['noise'] -- a NAME lookup, and the official classifier puts noise at index 8
+# of 15, not at 1. The fixture's other two columns are near-constant 0.01, so reading the wrong
+# index gives a different AUC, and a hard-coded index 1 gives P(acsh) = 0.01 -> AUC 0.5.
+_cls_auc = float(_cls_row.split()[4]) if _cls_row else float('nan')
+check('that row\'s AUC is the fixture\'s, so P(noise) was read by class NAME',
+      _cls_row is not None and _cls_auc > 0.9,
+      f'AUC={_cls_auc}; reading column 1 instead would give 0.5')
+
+_ident = [(ns18['model_tags'].get(r['path'], ''), r['name'].replace('.pk', ''), r)
+          for r in val_results]
 
 
 _matched = [(r, _row_for(tag, name)) for tag, name, r in _ident]
 _no_row = [name for (_tag, name, _r), (_m, ln) in zip(_ident, _matched) if ln is None]
 _no_kind = [name for (_tag, name, r), (_m, ln) in zip(_ident, _matched)
-            if ln is not None and r['kind'] not in ln]
+            if ln is not None and r['kind'] not in ln and not r.get('no_signal')]
 _kinds_ok = not _no_row and not _no_kind
 _detail = []
 if _no_row:
@@ -177,16 +264,35 @@ check('each table row carries its own kind text in the Note column', _kinds_ok,
       '; '.join(_detail) if _detail
       else f'{len(_matched)}/{len(val_results)} rows, each with its kind')
 check('no doubled "official official_"', 'official official_' not in tail)
-check('balanced accuracy is quoted as the fair comparison',
-      'BALANCED ACCURACY (the fair comparison)' in tail)
-check('fine-tuned gain line printed', 'fine-tuned best' in tail)
+# The gain section must state the numbers the FIXTURE holds, not merely exist. The pre-fix
+# cell printed only "official best X -> fine-tuned best Y"; the ported cell prints one line per
+# mic, pairing the official row with the fine-tuned one by name. Both forms are accepted as
+# long as the m09 gain equals the fixture's 0.750 -> 0.920 (+0.170), so a cell that printed the
+# wrong pairing, or the same number twice, fails here.
+_gain = [ln.strip() for ln in tail.split('\n') if 'm09:' in ln]
+_want_gain = '0.750 -> 0.920  (+0.170)'
+check('the fine-tuned gain line is printed with the fixture\'s own numbers',
+      any(_want_gain in ln for ln in _gain),
+      f'looking for {_want_gain!r} in {_gain}')
+check('balanced accuracy is named as the fair comparison above the gain lines',
+      'balanced accuracy' in tail.lower() and
+      any(ln.lower().startswith('balanced accuracy') for ln in
+          [x.strip() for x in tail.split('\n')]),
+      [ln.strip() for ln in tail.split('\n') if 'balanced accuracy' in ln.lower()][:1])
+head = out18[:out18.index('OFFICIAL (zero-shot) vs FINE-TUNED')]
 # The row evaluated on 90 of the 145 test clips must not be printed as if it were a
-# full-split row: its 90/145 denominator has to be visible in the table.
-check('reduced-denominator rows are flagged',
-      f'{NS_REDUCED}/{NS}' in tail, f'looking for {NS_REDUCED}/{NS}')
+# full-split row. The ported cell flags it in the Note column as "(only 90 clips)" and repeats
+# the count in the per-model section as "90 of 145 test clips"; both are asserted, because the
+# Note column is what a reader scanning the table actually sees.
+_red_row = _row_of(next(r for r in val_results if r['n_files'] == NS_REDUCED))
+check('reduced-denominator rows are flagged in the Note column',
+      _red_row is not None and f'only {NS_REDUCED} clips' in _red_row,
+      (_red_row or 'row not found').strip())
+check('the per-model section also shows the reduced denominator as n of total',
+      f'Files evaluated: {NS_REDUCED} of {NS} test clips' in head, 'looking for '
+      f'Files evaluated: {NS_REDUCED} of {NS} test clips')
 
 print('\n  --- full summary block, checking the per-model section too ---')
-head = out18[:out18.index('OFFICIAL (zero-shot) vs FINE-TUNED')]
 check('per-model section names the Mode', 'Mode:' in head)
 check('per-model section prints Files evaluated', 'Files evaluated' in head)
 check('the no-signal model gets an explicit warning in the per-model section',
