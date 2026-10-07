@@ -7,4 +7,38 @@ Claude_improvement_plan.md
 kaggle.ipynb
 kaggle2.ipynb
 kaggle3.ipynb
-.gitgnore
+
+# data / media files
+*.csv
+*.json
+*.wav
+*.zip
+
+# python cache
+__pycache__/
+*.pyc
+
+# untracked folders
+.claude/
+BatSpot_article/
+BatSpot_from_zipfile/
+
+# scratch / evidence files
+_EVIDENCE_*.txt
+_FINAL.txt
+_VERIFY.txt
+_sh.txt
+_verify.py
+
+# IDE
+.idea/shelf/
+.idea/workspace.xml
+
+# misc
+Intention_in_creating_notebook.md
+batspot-train (out_put).ipynb
+
+# untracked files
+Data for testing/
+Sonnet5.5_implimentation.md
+Space_Bunny_implimentation.md
