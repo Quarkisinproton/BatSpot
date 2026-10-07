@@ -19,6 +19,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _trainfix    # pulls in torch; only the execution block below needs it
 import extract_cells
 
 fails = []
@@ -81,9 +82,52 @@ for bad, should_raise in [('balanced_accuracy', False), ('accuracy', False),
 train_src = source(idx[CELL_TRAIN])
 check('train_model selects the metric via a dict lookup',
       "{'balanced_accuracy': val_bal, 'accuracy': val_acc}[SELECT_METRIC]" in train_src)
-_code_only = '\n'.join(ln.split('#')[0] for ln in train_src.split('\n'))
-check('the old if/else fallback is gone from CODE (it survives only in the fix comment)',
-      "SELECT_METRIC == 'balanced_accuracy'" not in _code_only)
+
+# The old form was `val_score = val_bal if SELECT_METRIC == 'balanced_accuracy' else val_acc`:
+# a ternary on SELECT_METRIC that DECIDES the validation score. Scanning for the bare substring
+# "SELECT_METRIC == 'balanced_accuracy'" is broader than that, and broader than the defect: the
+# training cell also compares SELECT_METRIC to pick the printout constant that turns a score gap
+# into "~how many validation clips", which decides nothing. So the scan is for the ASSIGNMENT
+# FORM -- an outermost ternary on SELECT_METRIC whose target is a validation-score name.
+#
+# Narrower than a substring scan, but not weaker for this defect: reintroduce the original line
+# and `val_score` matches on both counts, while the legitimate printout arithmetic does not.
+_SCORE_TARGETS = {'val_score', 'val_acc', 'val_bal', 'best_score'}
+
+
+def score_ternaries(src):
+    """Names assigned a ternary whose test compares SELECT_METRIC."""
+    out = []
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.IfExp):
+            continue
+        test = node.value.test
+        if not any(isinstance(c, ast.Compare) and any(
+                isinstance(x, ast.Name) and x.id == 'SELECT_METRIC'
+                for x in ast.walk(c)) for c in ast.walk(test)):
+            continue
+        for t in node.targets:
+            if isinstance(t, ast.Name) and t.id in _SCORE_TARGETS:
+                out.append(t.id)
+    return sorted(out)
+
+
+_ternaries = score_ternaries(train_src)
+check('no validation score is chosen by an if/else on SELECT_METRIC '
+      '(it survives only in the fix comment)', not _ternaries,
+      f'ternary-assigned in {_ternaries}' if _ternaries else '0 ternary score assignments')
+
+# The training cell legitimately keeps ONE comparison on SELECT_METRIC: the printout constant
+# that converts a score gap into "~how many validation clips". Name it, so a reader who meets it
+# is not left deciding whether it is the bug, and fail if a comparison appears anywhere else.
+_lines = train_src.split('\n')
+_cmp_lines = [i for i, ln in enumerate(_lines) if 'SELECT_METRIC ==' in ln]
+_offending = [i + 1 for i in _cmp_lines
+              if not any('_clip' in ln for ln in _lines[max(0, i - 1):i + 2])]
+check('every SELECT_METRIC comparison in the training cell is the clip-count printout, '
+      'not a score choice', not _offending,
+      f'unaccounted comparison(s) on line(s) {_offending}' if _offending
+      else f'{len(_cmp_lines)} comparison(s), all the _clip printout')
 # The dict lookup must be exercised, not merely recognised: run the cell's OWN selection
 # expression with a typo'd metric and require a KeyError. A local dict literal would only
 # prove CPython raises, and would pass even if the cell had reverted to an if/else.
@@ -112,6 +156,45 @@ _offenders = sorted(i for i, p in idx.items()
 check('the silent fallback appears in NO cell of the delivered notebook '
       '(the risk it addressed is still real)',
       not _offenders, f'found in cell(s) {_offenders}' if _offenders else '0 cells')
+
+# --- and by EXECUTION: the cell's own train_model, with a typo'd metric -----------------------------
+# The checks above prove the expression is present and that it raises. They cannot prove the
+# function REACHES it: a cell could keep the lookup as a dead statement while selecting on
+# something else spelled differently, which is why this runs the real training loop.
+#
+# Same fixture as test_bug1 (notebook_build/tests/_trainfix.py) -- two hand-written datasets are
+# how a suite ends up exercising something other than what its name claims; AGENTS.md 9.8 records
+# a check that asserted against its own inline copy of the function it meant to test.
+print('\n=== the cell\'s own train_model, executed with a typo\'d SELECT_METRIC ===')
+
+if not os.path.exists(idx[CELL_TRAIN]):
+    check('the training cell is present to execute', False, idx[CELL_TRAIN])
+else:
+    # Control: the same run with a VALID metric must complete. Without it, "raises KeyError"
+    # could be true for the trivial reason that every configuration fails.
+    _ctrl = _trainfix.base_cfg(n_epochs=2, epochs_per_eval=1)
+    _ctrl_ok, _ctrl_detail = True, ''
+    try:
+        _trainfix.run_trial(idx[CELL_TRAIN], _ctrl)
+    except Exception as e:                              # noqa: BLE001 - the point is that it must not
+        _ctrl_ok, _ctrl_detail = False, f'{type(e).__name__}: {e}'
+    check('a VALID SELECT_METRIC trains to completion (the control run)', _ctrl_ok, _ctrl_detail)
+
+    _typo = _trainfix.base_cfg(n_epochs=2, epochs_per_eval=1)
+    _raised, _why = False, 'no exception raised'
+    try:
+        _trainfix.run_trial(idx[CELL_TRAIN], _typo, extra={'SELECT_METRIC': 'balanced_acc'})
+    except KeyError as e:
+        _raised = True
+        _why = f'KeyError({e})'
+    except Exception as e:                              # noqa: BLE001 - any other error is a failure
+        _why = f'{type(e).__name__} instead of KeyError: {e}'
+    check("train_model raises KeyError when SELECT_METRIC is 'balanced_acc', rather than "
+          'silently training on plain accuracy', _raised, _why)
+    # The message must name the rejected metric, not some unrelated missing key: a KeyError from
+    # elsewhere in the function would otherwise satisfy the check above.
+    check('   ...and the KeyError names the bad metric, not an unrelated missing key',
+          _raised and "'balanced_acc'" in _why, _why)
 
 print('\n' + '=' * 62)
 print(f'{len(fails)} failure(s)' + ((': ' + ', '.join(fails)) if fails else ''))

@@ -17,22 +17,15 @@ Run: venv/bin/python notebook_build/tests/test_bug1.py
 """
 import atexit
 import os
+import re
 import shutil
 import sys
 import tempfile
-from collections import Counter
-from math import ceil
-import numpy as np
+
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from sklearn.metrics import accuracy_score, balanced_accuracy_score
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _trainfix
 import extract_cells
 
 CELL_TRAIN = 8   # Cell 9: Training Infrastructure
@@ -46,11 +39,7 @@ def check(name, cond, detail=''):
         fails.append(name)
 
 
-N_CLASS, DIM, NTR, NVA = 3, 16, 24, 18
-CFG = {'batch_size': 8, 'base_lr': 5e-3, 'n_epochs': 30, 'epochs_per_eval': 1,
-       'grad_accum_steps': 1, 'use_multi_gpu': False, 'num_classes': N_CLASS,
-       'beta1': 0.5, 'lr_decay_factor': 0.5, 'lr_patience_epochs': 3,
-       'early_stopping_patience_epochs': 4}
+CFG = _trainfix.base_cfg()
 
 idx = extract_cells.merged_cells()
 _TMP = tempfile.mkdtemp(prefix='batspot-bug1-')
@@ -58,79 +47,11 @@ atexit.register(shutil.rmtree, _TMP, True)
 CURVE = os.path.join(_TMP, '_curve_test.png')
 
 
-def get_class_from_filename(f):
-    return os.path.basename(f).split('-', 1)[0]
-
-
-class FakeDS(Dataset):
-    def __init__(self, n, seed):
-        g = torch.Generator().manual_seed(seed)
-        self.x = torch.randn(n, DIM, generator=g)
-        self.y = torch.randint(0, N_CLASS, (n,), generator=g)
-        self.file_names = [f'c{int(c)}-x_{i}.wav' for i, c in enumerate(self.y)]
-        self.class_to_idx = {f'c{i}': i for i in range(N_CLASS)}
-        self.labels = self.y.numpy()
-
-    def __len__(self):
-        return len(self.y)
-
-    def __getitem__(self, i):
-        return self.x[i], int(self.y[i])
-
-
-def make_model():
-    torch.manual_seed(1234)
-    return nn.Sequential(nn.Linear(DIM, 32), nn.ReLU(), nn.Linear(32, N_CLASS))
-
-
-def predict_proba(model, dataset, device, batch_size=256):
-    """Stand-in for the real clip-level scorer, which needs the full spectrogram front end.
-
-    The synthetic FakeDS holds tensors, not audio, so this is the minimal contract train_model
-    needs: (probs, labels) over the dataset's items.
-    """
-    model.eval()
-    with torch.no_grad():
-        out = torch.softmax(model(dataset.x), dim=1).numpy()
-    return out, dataset.y.numpy()
-
-
-def load_train_model(path):
-    """Exec the cell's train_model with the globals it expects.
-
-    Only `train_model` is requested: cell_defs pulls in `make_weighted_sampler`,
-    `compute_class_weights` and anything else it reads, by closure analysis. An earlier version
-    whitelisted those three names by hand, which worked only because the cell happened to
-    define exactly those; one added helper would have been a NameError deep inside a 30-epoch
-    training run.
-    """
-    ns = dict(np=np, torch=torch, nn=nn, optim=optim, os=os, plt=plt, Counter=Counter, ceil=ceil,
-              Dataset=Dataset, DataLoader=DataLoader,
-              WeightedRandomSampler=WeightedRandomSampler,
-              accuracy_score=accuracy_score,
-              balanced_accuracy_score=balanced_accuracy_score,
-              get_class_from_filename=get_class_from_filename,
-              SELECT_METRIC='balanced_accuracy', REPORT_TOPK_MEAN=3,
-              tqdm=lambda x, **k: x,
-              predict_proba=predict_proba)
-    return extract_cells.cell_defs(path, {'train_model'}, ns)['train_model']
-
-
-def rescore(model, val):
-    model.eval()
-    with torch.no_grad():
-        return balanced_accuracy_score(val.y.numpy(), model(val.x).argmax(1).numpy())
-
-
-def run(save_path):
-    train_model = load_train_model(idx[CELL_TRAIN])
-    tr, va = FakeDS(NTR, 7), FakeDS(NVA, 99)
-    torch.manual_seed(7)
-    np.random.seed(7)
-    m = make_model()
-    m, hist, best = train_model(m, tr, va, CFG, torch.device('cpu'), save_path=save_path)
-    flat = torch.cat([v.flatten() for v in m.state_dict().values()]).detach().clone()
-    return flat, best, hist, rescore(m, va)
+def run(save_path, cfg=None, extra=None):
+    """Train one trial; return (flat weights, best, history, re-scored validation score, stdout)."""
+    t = _trainfix.run_trial(idx[CELL_TRAIN], cfg or CFG, save_path=save_path,
+                            extra=extra, verbose=True)
+    return t.weights, t.best, t.history, t.score, t.out
 
 
 if os.path.exists(CURVE):
@@ -138,8 +59,8 @@ if os.path.exists(CURVE):
 print(f'=== under test: {os.environ.get("NEW_CELLS") or extract_cells.MERGED} cell '
       f'{CELL_TRAIN} ({os.path.basename(idx[CELL_TRAIN])}) ===')
 
-none_w, none_best, hist_none, none_score = run(None)
-path_w, path_best, hist_path, path_score = run(CURVE)
+none_w, none_best, hist_none, none_score, none_out = run(None)
+path_w, path_best, hist_path, path_score, _path_out = run(CURVE)
 print(f'  save_path=None : reported best={none_best:.4f}  re-scored={none_score:.4f}')
 print(f'  save_path=set  : reported best={path_best:.4f}  re-scored={path_score:.4f}')
 
@@ -164,10 +85,15 @@ check('the reported best equals the maximum of the recorded validation history',
 
 topk = hist_none.get('topk_mean')
 check('history carries the top-k mean', topk is not None,
-      'no "topk_mean" in history' if topk is None else f'topk_mean={topk[-1]:.4f}')
+      'no "topk_mean" in history' if topk is None else f'topk_mean={topk:.4f}')
 check('the top-k mean is below the argmax (selection optimism is visible)',
-      topk is not None and len(topk) > 0 and topk[-1] < none_best,
-      'no "topk_mean" in history' if not topk else f'gap={none_best - topk[-1]:+.4f}')
+      # A SCALAR, not a per-epoch list: the cell publishes the mean of the top-k validation
+      # scores of the whole run, and draws it as one axhline. An earlier version of this check
+      # subscripted it as topk[-1] and only ever passed because the key was ABSENT -- it never
+      # got far enough to notice. `isinstance(topk, float)` keeps that from drifting back.
+      isinstance(topk, float) and topk < none_best,
+      'no float "topk_mean" in history' if not isinstance(topk, float)
+      else f'gap={none_best - topk:+.4f}')
 check('best_epoch recorded', isinstance(hist_none.get('best_epoch'), int),
       f'epoch {hist_none.get("best_epoch")}')
 check('the training-curve PNG actually exists',
@@ -178,6 +104,70 @@ check('val_score history recorded', val is not None and len(val) > 0,
 check('lr history recorded', val is not None and len(hist_none['lr']) == len(val),
       VAL_MISSING if val is None
       else f'{len(hist_none["lr"])} lr vs {len(val)} validations')
+
+# --- the interface this cell is supposed to publish -------------------------------------------------
+# The plan names `hist['best_score']` as what a caller compares the re-scored model against, and
+# the cell's own selection print reads it back out of the history. Without it a caller has to
+# trust the returned third value and cannot cross-check it against the run.
+check("history carries best_score (the plan's interface for re-checking the returned model)",
+      isinstance(hist_none.get('best_score'), float)
+      and abs(hist_none['best_score'] - none_best) < 1e-12,
+      f'returned {none_best!r}, history {hist_none.get("best_score")!r}')
+check('history best_score is the max of the recorded val_score series',
+      val is not None and isinstance(hist_none.get('best_score'), float)
+      and abs(max(val) - hist_none['best_score']) < 1e-12,
+      f'max {max(val):.4f} vs {hist_none.get("best_score")}' if val else VAL_MISSING)
+
+# --- base_lr is ABSOLUTE, never scaled by the batch size --------------------------------------------
+# The notebook's LRs are the paper's 1e-4 (detector) / 3e-4 (classifier); an earlier version
+# multiplied by the batch size, which at 64 x 2 gradient accumulation was 128x too large and
+# diverged. The cell reports the LR it actually used, so this reads the real number rather than
+# the source text. batch_size is 8 here, so a scaled LR would be 8x off -- not confusable.
+_reported = re.search(r'Effective LR:\s*([0-9.eE+-]+)', none_out)
+check('the cell reported an effective LR at all (this check reads that line)',
+      _reported is not None,
+      '' if _reported is not None else 'no "Effective LR:" line in the run output')
+if _reported:
+    _lr = float(_reported.group(1))
+    check('the effective LR is config["base_lr"] itself, not scaled by the batch size',
+          abs(_lr - CFG['base_lr']) / CFG['base_lr'] < 1e-9,
+          f'reported {_lr:.3e} vs base_lr {CFG["base_lr"]:.3e} (batch {CFG["batch_size"]})')
+
+# --- exactly one class-balancing mechanism, observed by execution -----------------------------------
+# WeightedRandomSampler already draws each class with probability 1/n_classes; adding
+# CrossEntropyLoss class weights on top double-counts it, and on the detector that is a 4.18x
+# noise penalty which collapses the weakest-pretrained variant to all-noise. So both halves are
+# asserted: "no loss weights" alone would also be satisfied by dropping the sampler and losing
+# class balance altogether, which is the other half of the same defect. The shims delegate to the
+# real implementations, so the run being inspected is a real one.
+_spy = _trainfix.Spy()
+run(None, extra={'nn': _trainfix._NNShim(_spy),
+                 'DataLoader': _trainfix.make_loader_spy(_spy)})
+check('the cell built its loss without class weights (observed, not read)',
+      _spy.loss_kwargs is not None and _spy.loss_kwargs.get('weight') is None,
+      f'CrossEntropyLoss kwargs {_spy.loss_kwargs}')
+check('the cell balanced the classes with the WeightedRandomSampler',
+      _spy.loader_kwargs is not None and _spy.loader_kwargs.get('sampler') is not None,
+      f'DataLoader kwargs sampler={_spy.loader_kwargs.get("sampler") if _spy.loader_kwargs else None}')
+
+# --- early-stopping patience counts RAW epochs, not validation steps --------------------------------
+# The pre-fix counter incremented once per validation while validation runs every
+# epochs_per_eval epochs, so `early_stopping_patience_epochs: 20` silently meant 40 raw epochs.
+# Run with epochs_per_eval=2 and a 6-raw-epoch patience: a validation-step counter needs 6
+# validations, i.e. a 12-epoch gap; a raw-epoch counter stops at exactly 6.
+RAW_CFG = _trainfix.base_cfg(epochs_per_eval=2, early_stopping_patience_epochs=6, n_epochs=40)
+_raw_w, _raw_best, hist_raw, _raw_score, _raw_out = run(None, cfg=RAW_CFG)
+_cap = hist_raw['val_epoch'][-1] < RAW_CFG['n_epochs']
+check('the patience trial early-stopped before the epoch cap '
+      '(so the counter below is actually exercised)', _cap,
+      f'last validation epoch {hist_raw["val_epoch"][-1]} of {RAW_CFG["n_epochs"]}')
+_gap = hist_raw['val_epoch'][-1] - hist_raw['best_epoch']
+_step_counter_gap = (RAW_CFG['early_stopping_patience_epochs'] * RAW_CFG['epochs_per_eval'])
+check('early stopping fired exactly early_stopping_patience_epochs RAW epochs after the best '
+      f'(a validation-step counter would give {_step_counter_gap})',
+      _gap == RAW_CFG['early_stopping_patience_epochs'],
+      f'{_gap} raw epochs after epoch {hist_raw["best_epoch"]}, wanted '
+      f'{RAW_CFG["early_stopping_patience_epochs"]}')
 
 print('\n' + '=' * 62)
 print(f'{len(fails)} failure(s)' + (': ' + ', '.join(fails) if fails else ''))

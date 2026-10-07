@@ -56,23 +56,51 @@ N_BASE_CELLS = 24
 # YYYYMMDD_HHMMSS stamp and writes the shipped clip layout, so cell 6's recording_id
 # finds the tape. Copied verbatim: the comments recording the faithfulness to the R script
 # and its three deliberate deviations are the point of the cell.
+# 8 = training infrastructure: the combined notebook's cell 9. `train_model` plus the sampler /
+# class-weight helpers. Copied verbatim because the invariants it carries are not stylistic:
+#   - the loss is UNWEIGHTED CrossEntropyLoss while the batches are balanced by
+#     WeightedRandomSampler. Passing class weights as well double-counts it; on the detector
+#     that is a 4.18x noise penalty, which collapses the weakest-pretrained variant to all-noise.
+#   - `effective_lr = config['base_lr']`, absolute. The paper's 1e-4 / 3e-4 must not be scaled
+#     by the batch size (that is what diverged: 128x too large at batch 64 x accum 2).
+#   - `no_improve += config['epochs_per_eval']`, so `early_stopping_patience_epochs` counts RAW
+#     epochs. A validation-step counter silently doubled every patience in the notebook.
+#   - the metric is selected by dict lookup, `{...}[SELECT_METRIC]`, so a typo raises KeyError
+#     instead of degrading to plain accuracy on an 81/19 split. test_metric_guard.py reads this
+#     line out of the delivered cell and executes it; test_bug1.py pins the other three.
+#   - `config` stays a plain dict read by key, so a later cell can copy it per variant.
+# It also adds what the merged cell was missing: `history['val_score']`, `history['topk_mean']`
+# (selection optimism, made visible) and `history['best_score']`.
 # 9 = model staging: the combined notebook's cell 10. The four official models are ALL
 # basenamed ANIMAL-SPOT.pk, so staging by basename collides silently -- the classifier
 # overwrites the detector and you fine-tune a "detector" from 15-class weights.
+# 11 = detectors: the combined notebook's cell 12. Trains and evaluates ALL THREE variants
+# (m03/m09/m11) from one loop, and defines `evaluate_model` (the clip-level scorer cells 12, 13,
+# 16 and 17 all call). Copied verbatim so `det_results[mic]` keeps the key set the export and
+# summary cells read: model / metrics / best_val_acc / history / encoderOpts / classifierOpts.
+# 12 = classifier: the combined notebook's cell 13. One model per CLS_ENSEMBLE_SEEDS seed ->
+# `cls_members` (dicts of seed/model/best_val/history/metrics), `cls_model` a `SoftmaxEnsemble`
+# when there is more than one, `cls_best_member` the best single member (the BatSpot GUI / CLI
+# loads one model), and `UNKNOWN_MODEL`, the fitted open-set sidecar. THIS CELL IS WHAT MAKES
+# THE NOTEBOOK EXECUTABLE TOP TO BOTTOM: cell 14 reads all three of those names, and before this
+# port nothing defined them. test_assemble.py's `every loaded name is bound by an earlier cell`
+# check failed on exactly that gap and is now green.
+# 13 = cascade: the combined notebook's cell 14. `run_combined_pipeline` tunes the detector
+# threshold on VALIDATION (maximise call F1, grid 0.05-0.95) and then reports
+# classifier-alone / hard-gate / soft-combine side by side, because the classifier already has
+# a `noise` class and a hard gate can only add the detector's own errors. Prior correction is
+# deliberately absent here (plan section 1 records it as a scope decision): with a tuned
+# threshold, rescaling P(call) by a prior ratio is monotone and changes no decisions.
 # 14 = export: the combined notebook's cell 15. export_pk deep-copies before .cpu(), so the
 # LIVE models stay on the GPU; also writes every ensemble member and the unknown sidecar.
-# KNOWN GAP (not a defect in the port): this cell reads `cls_members`, `cls_best_member` and
-# `UNKNOWN_MODEL`, which no cell of the notebook defines yet -- the ensemble cell that will
-# define them is Task 8's port of c12. The artifact therefore executes through cell 13 and
-# stops there. test_assemble.py's `every loaded name is bound by an earlier cell` check FAILS
-# on exactly this, and is meant to: it is the guard that will go green when Task 8 lands.
 # 16 = evaluation: the combined notebook's cell 17. num_mels fallback, class names indexed by
 # output width (not by sorted dict value), and the no_signal flag.
 # 17 = summary: the combined notebook's cell 18. kind / n_files columns, NO SIGNAL markers and
 # the reduced-denominator warning.
 REPLACE: dict[int, str] = {
     1: 'src_01.py', 4: 'src_04.py', 5: 'src_05.py', 6: 'src_06.py', 7: 'src_07.py',
-    9: 'src_09.py', 14: 'src_14.py', 16: 'src_16.py', 17: 'src_17.py',
+    8: 'src_08.py', 9: 'src_09.py', 11: 'src_11.py', 12: 'src_12.py', 13: 'src_13.py',
+    14: 'src_14.py', 16: 'src_16.py', 17: 'src_17.py',
 }
 
 # Cells appended after the base cells, markdown first then code.
