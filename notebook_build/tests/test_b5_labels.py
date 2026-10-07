@@ -49,18 +49,6 @@ idx = extract_cells.merged_cells()
 REPO = extract_cells.REPO
 
 
-def exec_cell(i, ns):
-    path = idx[i]
-    exec(compile(open(path, encoding='utf-8').read(), path, 'exec'), ns)
-    return path
-
-
-# The summary cell is exec'd through this rather than run_cell6, because it needs its own
-# (much larger) fixture -- val_results, the confusion matrices, cls_metrics -- and none of
-# cell 6's globals. Kept so a cell that stops running is a reported failure, not a traceback
-# that hides the B5 checks below.
-
-
 # =========================================================================================
 # B4 -- run the notebook's Cell 7 and call ITS recording_id
 # =========================================================================================
@@ -105,7 +93,6 @@ print('\n=== B5: the results-summary table, from the delivered cell ===')
 NS, NS_REDUCED = 145, 90
 y_bin = np.array([0] * 28 + [1] * 117)
 p_call_sig = np.concatenate([np.linspace(0.05, 0.45, 28), np.linspace(0.55, 0.95, 117)])
-p_call_dead = np.full(NS, 0.9)          # says "call" for everything -> acc 0.807, AUC ~0.5
 y_red = np.array([0] * 17 + [1] * (NS_REDUCED - 17))
 p_red = np.concatenate([np.linspace(0.05, 0.45, 17), np.linspace(0.55, 0.95, NS_REDUCED - 17)])
 
@@ -144,11 +131,30 @@ CLS_CLASSES = ['acsh', 'alte', 'noise']
 CLS_CLASS_TO_IDX = {c: i for i, c in enumerate(CLS_CLASSES)}
 det_results = {'m09': {'metrics': {'labels': y_bin, 'accuracy': 0.91, 'balanced_accuracy': 0.92,
                                    'probs': np.stack([1 - p_call_sig, p_call_sig], 1)}}}
-# 28 noise clips then 117 call clips, exactly like the binary fixture above. The cell derives
-# P(call) = 1 - P(noise), so P(noise) must be HIGH on the noise clips: 0.55..0.95 there and
-# 0.05..0.45 on the call clips. Getting this backwards yields a classifier at chance, which
-# would silently turn this row into another NO SIGNAL row.
+# The fine-tuned classifier's OWN numbers, computed here by hand from `cls_metrics` so the
+# checks below assert the fixture's arithmetic rather than a substring.
+#
+# The fixture is deliberately IMPERFECT. An earlier version separated the two classes perfectly,
+# which made accuracy, balanced accuracy and AUC all exactly 1.0000 -- so the three printed
+# columns were indistinguishable and the check read the ACCURACY column while claiming to test
+# the AUC. Now:
+#   * 2 of the 28 noise clips get a LOW P(noise) -> predicted "call"  (false alarms)
+#   * 5 of the 117 call clips get a HIGH P(noise) -> predicted "noise" (misses)
+# so the three numbers differ: accuracy is majority-weighted (call is 117/145 here, so it is the
+# HIGHER of the two), balanced accuracy is the per-class mean, and the AUC ranks by confidence.
+def _cls_row_truth():
+    labels = cls_metrics['labels']
+    y = (labels != CLS_CLASS_TO_IDX['noise']).astype(int)      # 0 = noise, 1 = call
+    p = 1.0 - cls_metrics['probs'][:, CLS_CLASS_TO_IDX['noise']]
+    return labels, y, p
+
+
 _p_cls_noise = np.concatenate([np.linspace(0.55, 0.95, 28), np.linspace(0.05, 0.45, 117)])
+# 2 noise clips look like calls, 5 call clips look like noise. Both errors are made with a
+# probability close to 0.5 (an unsure model), which is what leaves the AUC high while dragging
+# accuracy down -- the real shape of a model that is good but not perfect.
+_p_cls_noise[[2, 11]] = 0.40                                  # noise clips, predicted "call"
+_p_cls_noise[[30, 45, 60, 75, 100]] = 0.62                    # call clips, predicted "noise"
 _noise_col = CLS_CLASS_TO_IDX['noise']
 cls_metrics = {
     'labels': np.array([CLS_CLASS_TO_IDX['noise']] * 28 + [CLS_CLASS_TO_IDX['acsh']] * 117),
@@ -177,10 +183,15 @@ for ln in tail.split('\n'):
     if ln.strip():
         print('   |' + ln[:100])
 
-summary_src = open(_cell17, encoding='utf-8').read()
-check('table shows an n (denominator) column', '"n":>4' in summary_src
-      and '|n:' not in tail and 'n  ' in tail)
-check('table shows a Note/kind column', 'Note' in tail)
+# The header must name its columns, and each data row must carry a number under each. An
+# earlier version asserted `'"n":>4' in summary_src` (grepping the SOURCE, not the output),
+# `'|n:' not in tail` (no cell prints `n:`) and `'n  ' in tail` (a bare substring that a row's
+# Note would satisfy). All three near-trivially true. What is actually asserted here is the
+# rendered header and, below, a per-row column count.
+_hdr = next((ln for ln in tail.split('\n')
+             if ln.strip().startswith('Model')), '')
+check('the header names n, Acc, Bal acc, AUC and Note',
+      all(h in _hdr for h in ('n', 'Acc', 'Bal acc', 'AUC', 'Note')), _hdr.strip())
 
 # --- locating a printed row -----------------------------------------------------------------
 # Each official row must carry ITS OWN kind in the Note column. Three things this must not do:
@@ -219,6 +230,67 @@ def _row_of(r):
 # would pass if the marker were printed on any row at all, or in the legend.
 _dead = next(r for r in val_results if r.get('no_signal'))
 _dead_row = _row_of(_dead)
+# Each row must carry FOUR numbers after its label (n, acc, bal, auc) and then a non-empty
+# Note. This is the "Note/kind column" check done properly: the previous version asserted only
+# that the word "Note" appeared somewhere in the section, which says nothing about any row.
+def _note_for(r):
+    """The Note text this row's fixture implies the cell should print for it: the NO SIGNAL
+    marker for a signal-free row, else the row's own kind, plus the reduced-denominator
+    suffix when the row was scored on fewer clips than the split has."""
+    if r.get('no_signal'):
+        return 'NO SIGNAL (AUC~0.5): plain accuracy just reflects the class mix'
+    return r['kind'] + ('' if r['n_files'] == NS else f' (only {r["n_files"]} clips)')
+
+
+def _label_for(r):
+    """The label the cell prints for this row: the name minus '.pk', with the first underscore
+    turned into a space (the B5 fix -- the pre-fix cell printed 'official official_...')."""
+    return r['name'].replace('.pk', '').replace('_', ' ', 1)
+
+
+def _numeric_cols(r, row):
+    """The four numeric tokens between the row's label and its Note, or None if the row has
+    the wrong shape.
+
+    Sliced from the FRONT by the label's length: the row is `{label} {n} {acc} {bal} {auc} {note}`
+    and both the label and the Note contain spaces, so the note's length cannot be used to find
+    the numbers from the back (and a bare tail slice silently returns Note words as numbers)."""
+    if row is None:
+        return None
+    toks = row.split()
+    i = len(_label_for(r).split())
+    return toks[i:i + 4] if len(toks) >= i + 4 else None
+
+
+def _all_numeric(toks):
+    """True iff every token parses as a float. A row's numbers must be numbers, not note words."""
+    try:
+        [float(t) for t in toks]
+        return True
+    except ValueError:
+        return False
+
+
+_bad_shape = []
+for r in val_results:
+    cols = _numeric_cols(r, _row_of(r))
+    if cols is None or len(cols) != 4 or not _all_numeric(cols):
+        _bad_shape.append((r['name'], cols))
+check('every official row prints 4 NUMERIC columns between its label and its Note',
+      not _bad_shape, str(_bad_shape) if _bad_shape
+      else f'{len(val_results)} rows, each n / acc / bal / auc')
+# And the n column must equal the row's own n_files -- a cell printing the total on every row
+# would pass a "4 numbers" check while misrepresenting the reduced-denominator row.
+_bad_n = []
+for r in val_results:
+    cols = _numeric_cols(r, _row_of(r))
+    if cols is None:
+        _bad_n.append((r['name'], 'row not found or malformed'))
+    elif int(cols[0]) != r['n_files']:
+        _bad_n.append((r['name'], f'printed {cols[0]}, fixture {r["n_files"]}'))
+check("the n column on each row equals that row's own n_files",
+      not _bad_n, str(_bad_n) if _bad_n
+      else f'm03={NS}, classifier={NS}, m11={NS_REDUCED}, m09={NS} as the fixture holds')
 check('the signal-free row itself is marked NO SIGNAL',
       _dead_row is not None and 'NO SIGNAL' in _dead_row,
       (_dead_row or 'row not found').strip())
@@ -237,14 +309,43 @@ check('the fine-tuned classifier has its own call-vs-noise row',
 check('that row is labelled as a classifier, not a detector',
       _cls_row is not None and 'classifier as noise-vs-call' in _cls_row
       and 'detector' not in _cls_row, (_cls_row or 'row not found').strip())
-# And the numbers on it must be the fixture's. The cell derives P(call) = 1 - P(noise) using
-# CLS_CLASS_TO_IDX['noise'] -- a NAME lookup, and the official classifier puts noise at index 8
-# of 15, not at 1. The fixture's other two columns are near-constant 0.01, so reading the wrong
-# index gives a different AUC, and a hard-coded index 1 gives P(acsh) = 0.01 -> AUC 0.5.
-_cls_auc = float(_cls_row.split()[4]) if _cls_row else float('nan')
-check('that row\'s AUC is the fixture\'s, so P(noise) was read by class NAME',
-      _cls_row is not None and _cls_auc > 0.9,
-      f'AUC={_cls_auc}; reading column 1 instead would give 0.5')
+# The printed layout is `{label:<34} {n:>4} {acc:>7.4f} {bal:>8.4f} {auc:>7.4f}  {note}`, and both
+# the label and the note contain spaces, so the numbers are located by the LABEL's length from
+# the front -- not by counting back from the note, which silently returns note words instead.
+_lbl, _y, _p = _cls_row_truth()
+check("the classifier fixture's labels are its class INDICES, matching what the cell compares",
+      np.array_equal(_lbl, np.array([CLS_CLASS_TO_IDX['noise']] * 28
+                                    + [CLS_CLASS_TO_IDX['acsh']] * 117)),
+      f'first={_lbl[0]}, 28th={_lbl[27]}, 29th={_lbl[28]}, last={_lbl[-1]} '
+      f'(CLS_CLASS_TO_IDX={CLS_CLASS_TO_IDX})')
+_want_acc = float(np.mean((_p >= 0.5) == _y))
+_want_bal = float(balanced_accuracy_score(_y, (_p >= 0.5).astype(int)))
+_want_auc = float(roc_auc_score(_y, _p))
+check("the classifier row's three metrics differ, so the columns are distinguishable",
+      len({_want_acc, _want_bal, _want_auc}) == 3,
+      f'acc={_want_acc:.4f} bal={_want_bal:.4f} auc={_want_auc:.4f}')
+# The ordering of the three numbers is itself a discriminator: with `call` the majority class,
+# majority-weighted accuracy is the highest of the three, balanced accuracy lower, and the
+# AUC (a ranking measure) in between. A cell printing the right values in the wrong COLUMNS
+# would break this ordering, so it is asserted rather than left to the individual value checks.
+check('accuracy > balanced accuracy > 0 and AUC > balanced accuracy (the fixture\'s ordering)',
+      _want_acc > _want_bal and _want_auc > _want_bal,
+      f'acc={_want_acc:.4f} bal={_want_bal:.4f} auc={_want_auc:.4f}')
+_cls_cols = _numeric_cols({'name': 'fine-tuned classifier (noise?)', 'n_files': NS},
+                          _cls_row)
+_cls_floats = [float(c) for c in _cls_cols] if _cls_cols and len(_cls_cols) == 4 else None
+check("the classifier row's ACC is the fixture's, so P(noise) was read by class NAME",
+      _cls_floats is not None and abs(_cls_floats[1] - _want_acc) < 5e-5,
+      f'printed {_cls_cols} vs expected acc={_want_acc:.4f}'
+      + ('' if _cls_cols is None else f'; reading column 1 gives '
+         f'{float(np.mean((cls_metrics["probs"][:, 1] >= 0.5) == _y)):.4f}'))
+check("the classifier row's BALANCED ACC is the fixture's",
+      _cls_floats is not None and abs(_cls_floats[2] - _want_bal) < 5e-5,
+      f'printed {_cls_cols[2] if _cls_cols else None} vs expected {_want_bal:.4f}')
+check("the classifier row's AUC is the fixture's (a separate quantity from accuracy)",
+      _cls_floats is not None and abs(_cls_floats[3] - _want_auc) < 5e-5,
+      f'printed auc={_cls_cols[3] if _cls_cols else None} vs expected {_want_auc:.4f} '
+      f'(accuracy is {_want_acc:.4f})')
 
 _ident = [(ns18['model_tags'].get(r['path'], ''), r['name'].replace('.pk', ''), r)
           for r in val_results]
@@ -274,11 +375,17 @@ _want_gain = '0.750 -> 0.920  (+0.170)'
 check('the fine-tuned gain line is printed with the fixture\'s own numbers',
       any(_want_gain in ln for ln in _gain),
       f'looking for {_want_gain!r} in {_gain}')
-check('balanced accuracy is named as the fair comparison above the gain lines',
-      'balanced accuracy' in tail.lower() and
-      any(ln.lower().startswith('balanced accuracy') for ln in
-          [x.strip() for x in tail.split('\n')]),
-      [ln.strip() for ln in tail.split('\n') if 'balanced accuracy' in ln.lower()][:1])
+# The name says "above the gain lines", so the ORDER is asserted: the heading must be printed
+# before the per-mic gain lines, not merely somewhere in the section. A cell that printed the
+# heading last would still satisfy a bare "a line starts with balanced accuracy".
+_lines = [ln.strip() for ln in tail.split('\n')]
+_bal_i = next((i for i, ln in enumerate(_lines) if ln.lower().startswith('balanced accuracy')), -1)
+_gain_i = next((i for i, ln in enumerate(_lines) if ln.startswith('m09:')), -1)
+check('balanced accuracy is named as the fair comparison, ABOVE the gain lines',
+      _bal_i >= 0 and _gain_i >= 0 and _bal_i < _gain_i,
+      f'heading at line {_bal_i}, m09 gain at line {_gain_i}'
+      if _bal_i >= 0 and _gain_i >= 0 else
+      f'heading found={_bal_i >= 0}, gain line found={_gain_i >= 0}')
 head = out18[:out18.index('OFFICIAL (zero-shot) vs FINE-TUNED')]
 # The row evaluated on 90 of the 145 test clips must not be printed as if it were a
 # full-split row. The ported cell flags it in the Note column as "(only 90 clips)" and repeats

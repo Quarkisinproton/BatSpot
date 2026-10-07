@@ -53,6 +53,11 @@ N_BASE_CELLS = 24
 # overwrites the detector and you fine-tune a "detector" from 15-class weights.
 # 14 = export: the combined notebook's cell 15. export_pk deep-copies before .cpu(), so the
 # LIVE models stay on the GPU; also writes every ensemble member and the unknown sidecar.
+# KNOWN GAP (not a defect in the port): this cell reads `cls_members`, `cls_best_member` and
+# `UNKNOWN_MODEL`, which no cell of the notebook defines yet -- the ensemble cell that will
+# define them is Task 8's port of c12. The artifact therefore executes through cell 13 and
+# stops there. test_assemble.py's `every loaded name is bound by an earlier cell` check FAILS
+# on exactly this, and is meant to: it is the guard that will go green when Task 8 lands.
 # 16 = evaluation: the combined notebook's cell 17. num_mels fallback, class names indexed by
 # output width (not by sorted dict value), and the no_signal flag.
 # 17 = summary: the combined notebook's cell 18. kind / n_files columns, NO SIGNAL markers and

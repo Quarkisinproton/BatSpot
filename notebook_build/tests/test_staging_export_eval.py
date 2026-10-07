@@ -370,8 +370,8 @@ try:
     check('a DataParallel-wrapped model exports without error',
           dp_err is None, dp_err or 'exported')
     if dp_err is None:
-        dp_pk = load_dp = torch.load(os.path.join(dp_work, 'classifier_250khz.pk'),
-                                     map_location='cpu', weights_only=False)
+        dp_pk = torch.load(os.path.join(dp_work, 'classifier_250khz.pk'),
+                           map_location='cpu', weights_only=False)
         check('the exported weights carry NO "module." prefix (they would not load otherwise)',
               all(not k.startswith('module.') for k in dp_pk['encoderState'])
               and all(not k.startswith('module.') for k in dp_pk['classifierState']),
@@ -404,23 +404,30 @@ class _Model:
 
 
 def eval_ns(models, tag_map=None):
-    """A namespace that runs the whole evaluation cell over `models` (path -> spec)."""
+    """A namespace that runs the whole evaluation cell over `models` (path -> spec).
+
+    `WINDOWED` records, per model, the dataset config the cell built for it. The model is
+    identified by the `load_any_model` call that immediately precedes it, so the record is
+    keyed by the .pk path rather than by the file list -- every model is scored on the SAME
+    test clips, so the file list cannot tell them apart.
+    """
     queue = list(models.values())
 
     def load_any_model(path, device):
         spec = models[path]
+        _current.append(path)
         return _Model(spec['classes']), spec['classes'], spec['dataOpts']
 
     def windowed(files_, label_map, cfg, train=False):
-        WINDOWED.append((list(files_), dict(label_map), dict(cfg)))
+        WINDOWED.append((_current[-1] if _current else None, list(files_),
+                         dict(label_map), dict(cfg)))
         return list(files_)
 
     def predict_proba(model, ds, device):
-        n = len(list(ds))
         spec = queue.pop(0)
         return np.asarray(spec['probs']), np.asarray(spec['labels'])
 
-    WINDOWED = []
+    WINDOWED, _current = [], []
     return {
         'os': os, 'np': np, 'torch': torch,
         'roc_auc_score': roc_auc_score, 'accuracy_score': accuracy_score,
@@ -450,16 +457,17 @@ p_live = np.stack([1 - np.linspace(0.05, 0.95, 6), np.linspace(0.05, 0.95, 6)], 
 # AUC is at chance by construction of the fixture, not of the cell.
 p_dead = np.full((len(FILES), 15), 0.1 / 14)
 p_dead[:, CLS_15['noise']] = 0.9
-mels_spec = {'classes': DET_2, 'dataOpts': {'sr': 192000, 'n_fft': 256, 'hop_length': 128,
-                                            'num_mels': 64, 'fmin': 1000, 'fmax': 95000}}
-mel_names = [None] * 6
+# A model that stores num_mels and NOT n_freq_bins, which predict.py's fallback chain handles
+# and a hard-coded 256-bin default would silently get wrong.
+MEL_DATAOPTS = {'sr': 192000, 'n_fft': 256, 'hop_length': 128,
+                'num_mels': 64, 'fmin': 1000, 'fmax': 95000}
 p_multi = np.eye(6)[np.array([0, 5, 1, 0, 5, 1])]
 ns16, w16 = eval_ns({
     '/m/detector.pk': {'classes': DET_OFFICIAL, 'dataOpts': dict(DET_DATA),
                        'probs': p_live, 'labels': y2},
     '/m/dead_classifier.pk': {'classes': CLS_15, 'dataOpts': dict(CLS_DATA),
                               'probs': p_dead, 'labels': y2},
-    '/m/mel_model.pk': {'classes': DET_OFFICIAL, 'dataOpts': mels_spec['dataOpts'],
+    '/m/mel_model.pk': {'classes': DET_OFFICIAL, 'dataOpts': MEL_DATAOPTS,
                         'probs': p_live, 'labels': y2},
 })
 p16, out16 = run_cell(CELL_EVAL, ns16)
@@ -468,13 +476,19 @@ res16 = ns16.get('val_results', [])
 check('every model is scored on the same test clips',
       len(res16) == 3 and all(r.get('n_files') == len(FILES) for r in res16),
       str([r.get('n_files') for r in res16]))
-mel_cfg = [c for _f, _l, c in w16 if c['n_freq_bins'] == 64]
+# The dataset configs are captured per model and keyed by the .pk they were built for, so each
+# is asserted against the dataOpts of that model. An earlier version filtered
+# `if c['n_freq_bins'] != 64`, which removed the mel model from its own check, so that check
+# could not fail on it.
+_bins = {path: cfg['n_freq_bins'] for path, _f, _l, cfg in w16}
 check('a model storing num_mels is fed num_mels bins, not the 256-bin default',
-      len(mel_cfg) == 1 and mel_cfg[0]['n_freq_bins'] == 64,
-      f"n_freq_bins passed to the dataset: {sorted({c['n_freq_bins'] for _f, _l, c in w16})}")
-check('n_freq_bins from dataOpts is preferred when present',
-      all(c['n_freq_bins'] == 256 for _f, _l, c in w16
-          if c['n_freq_bins'] != 64), 'the two dataOpts-shaped models get 256')
+      _bins.get('/m/mel_model.pk') == 64,
+      f"mel model (num_mels=64) got {_bins.get('/m/mel_model.pk')}")
+check('n_freq_bins from dataOpts is preferred when present (the detector, 256 bins)',
+      _bins.get('/m/detector.pk') == 256,
+      f"detector (n_freq_bins=256) got {_bins.get('/m/detector.pk')}")
+check('each of the three models got a config of its own',
+      len(_bins) == 3 and all(v is not None for v in _bins.values()), str(_bins))
 check('the signal-free model is flagged no_signal; the informative one is not',
       len(res16) == 3 and res16[1].get('no_signal') is True
       and res16[0].get('no_signal') is False and res16[2].get('no_signal') is False,

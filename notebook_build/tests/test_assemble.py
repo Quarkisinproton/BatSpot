@@ -16,9 +16,17 @@ Contracts the whole build rests on:
      so the artifact never claims to have been executed.
   7. The committed batspot-train-merged.ipynb matches a fresh build, so the
      artifact is never stale relative to assemble.py.
+  8. Every name a code cell LOADS is bound by an earlier cell. Cells share one
+     kernel namespace, so a cell reading a name nothing before it defines raises
+     NameError when the notebook is run -- and nothing else here notices, because
+     every suite that reads such a cell supplies the missing names in its own
+     fixture. This check currently FAILS, at cell 14, by design: see the comment
+     on test_every_loaded_name_is_bound_by_an_earlier_cell.
 
 Run: venv/bin/python notebook_build/tests/test_assemble.py
 """
+import ast
+import builtins
 import contextlib
 import copy
 import io
@@ -29,7 +37,9 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import assemble
+import extract_cells
 
 fails = []
 
@@ -74,6 +84,167 @@ def test_base_carries_no_saved_execution_state():
         f'base code cells {dirty} carry saved outputs/execution_count; build() strips '
         'them, so the empty build is no longer lossless. Commit the base without '
         'outputs (nbformat clears them on save), or drop the pass-through claim.')
+
+
+# ---------------------------------------------------------------------------
+# Why this check exists
+#
+# This is the check whose absence let an artifact through that cannot execute. Cell 14 (the
+# export cell) reads `cls_best_member`, `cls_members` and `UNKNOWN_MODEL`, which no cell of the
+# notebook defines -- the ensemble cell that will define them is Task 8. Nothing in the build
+# noticed: build() checks that each replacement is the right cell TYPE and the right byte
+# content, and every suite that reads cell 14 supplies the missing names itself in a fixture.
+# The artifact only fails when a human runs it top to bottom.
+#
+# So this is checked at the artifact level, on every build. The contract is deliberately strict:
+# cells share one kernel namespace top to bottom, so a name a cell loads and no earlier cell
+# binds is a NameError waiting to happen. It FAILS today, at cell 14, and that is the intended
+# signal -- not a bug in this suite. It goes green when Task 8 lands the ensemble cell.
+# ---------------------------------------------------------------------------
+
+_MAGIC = ('!', '%', '?')
+
+
+def parse_cell(src):
+    """Parse a cell's source, blanking IPython magics (`!pip`, `%cd`) that are not Python.
+
+    Returns (tree, n_magics_blanked). One cell in the base is a `!pip install`; without this
+    the analysis would abort on the first cell it reached and check nothing.
+    """
+    try:
+        return ast.parse(src), 0
+    except SyntaxError:
+        pass
+    lines = src.split('\n')
+    n = sum(1 for ln in lines if ln.strip().startswith(_MAGIC))
+    blanked = '\n'.join('' if ln.strip().startswith(_MAGIC) else ln for ln in lines)
+    try:
+        return ast.parse(blanked), n
+    except SyntaxError as e:
+        raise ValueError(f'cell does not parse even after blanking {n} magic line(s): {e}')
+
+
+def bound_names(tree):
+    """Every name the cell binds at any level: defs, classes, imports, stores, args, excepts."""
+    out = set()
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(n.name)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            for a in n.names:
+                out.add((a.asname or a.name).split('.')[0])
+        elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+            out.add(n.id)
+        elif isinstance(n, ast.arg):
+            out.add(n.arg)
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            out.add(n.name)
+        elif isinstance(n, ast.Global):
+            out.update(n.names)
+    return out
+
+
+def unbound_loads(cells):
+    """{cell index: sorted names that cell loads which no EARLIER cell binds}.
+
+    Markdown cells bind nothing and are skipped. Cell 1 (the first code cell) is reported
+    against the empty namespace, so a name it loads from nowhere shows up rather than being
+    excused as "the first cell".
+    """
+    bound_so_far = set()
+    out = {}
+    for i, cell in enumerate(cells):
+        if cell.get('cell_type') != 'code':
+            continue
+        tree, _n = parse_cell(''.join(cell['source']))
+        own = bound_names(tree)
+        loaded = {n.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+        out[i] = sorted(loaded - own - set(dir(builtins)) - bound_so_far)
+        bound_so_far |= own
+    return out
+
+
+def artifact_cells():
+    """The artifact's cells, honouring NEW_CELLS.
+
+    `_mutate.py` points the suites at an extracted, possibly-mutated copy through NEW_CELLS.
+    Reading the committed artifact unconditionally would make this check blind to every
+    mutation aimed at it -- a green run that proves nothing, the failure mode AGENTS.md 9.8
+    records.
+    """
+    override = os.environ.get('NEW_CELLS')
+    if not override:
+        return json.load(open(assemble.OUT))['cells']
+    return [{'cell_type': 'markdown' if p.endswith('.md') else 'code',
+             'source': [open(p, encoding='utf-8').read()]}
+            for _i, p in sorted(extract_cells.dir_map(override, 'NEW_CELLS').items())]
+
+
+def test_every_loaded_name_is_bound_by_an_earlier_cell():
+    """Cells share one namespace; a name a cell loads and nothing before it binds is a
+    NameError at run time. Reported per offending cell, with the names, and FAILs if any
+    cell has one -- including a partial failure, so the message names every affected cell."""
+    nb_cells = artifact_cells()
+    bad = {i: names for i, names in unbound_loads(nb_cells).items() if names}
+    detail = '; '.join(f'cell {i}: {names}' for i, names in sorted(bad.items()))
+    check('every code cell loads only names an earlier cell binds (the artifact executes '
+          'top to bottom)', not bad,
+          detail if bad else f'{len(nb_cells)} cells, no unbound loads')
+
+
+def test_unbound_analysis_detects_a_missing_binding():
+    """The oracle above must be able to fail. Two code cells where the second reads a name
+    the first never binds; if the analysis returned {} for that, it would report 'no unbound
+    names' for the real artifact no matter what was wrong with it."""
+    cells = [
+        {'cell_type': 'code', 'source': ['a = 1\n']},
+        {'cell_type': 'code', 'source': ['b = a + 1\n', 'print(c)\n']},
+    ]
+    got = {i: n for i, n in unbound_loads(cells).items() if n}
+    check('a name no earlier cell binds is reported, with its cell and name',
+          got == {1: ['c']}, str(got))
+    ok_cells = [
+        {'cell_type': 'code', 'source': ['a = 1\n']},
+        {'cell_type': 'code', 'source': ['b = a + 1\n', 'def f(x):\n', '    return x + b\n']},
+    ]
+    got_ok = {i: n for i, n in unbound_loads(ok_cells).items() if n}
+    check('a properly chained pair of cells reports nothing', got_ok == {}, str(got_ok))
+    check('a cell binding its own name is not reported against itself',
+          unbound_loads([{'cell_type': 'code', 'source': ['x = 1\nprint(x)\n']}]) == {0: []})
+
+
+def test_unbound_analysis_reaches_the_last_cell():
+    """The check must be able to name a LATE cell, not just the first few.
+
+    If the walk stopped early -- say at the first cell with a magic, or at some depth limit --
+    it would silently under-report, and a reader would take its 'no unbound names' as a clean
+    bill of health for the cells it never looked at. The artifact's real gap is at cell 14 of
+    24, so a chain of 20 cells with the break in the last one must be reported.
+    """
+    cells = [{'cell_type': 'code', 'source': ['a = 1\n']}]
+    for i in range(18):
+        cells.append({'cell_type': 'code', 'source': [f'v{i} = a + {i}\n']})
+    cells.append({'cell_type': 'code', 'source': ['w = v17 + 1\n', 'print(missing_name)\n']})
+    got = {i: n for i, n in unbound_loads(cells).items() if n}
+    check('a break in the LAST cell of a 20-cell chain is still reported',
+          got == {19: ['missing_name']}, f'{len(cells)} cells, reported {got}')
+
+
+def test_unbound_analysis_survives_an_ipython_magic_cell():
+    """Cell 2 of the base is a bare `!pip install`, which is not Python. Without magic
+    handling the walk raises SyntaxError on the second cell and the real check never runs --
+    a green run that proved nothing, the failure mode AGENTS.md 9.8 records."""
+    nb_cells = artifact_cells()
+    got = unbound_loads(nb_cells)
+    check('a cell that is only an IPython magic does not abort the walk',
+          len(got) >= 20, f'{len(got)} code cells analysed of {len(nb_cells)} total')
+    check('the magic cell itself is analysed (cell 2), not skipped',
+          2 in got, f'cells analysed: {sorted(got)[:6]}...')
+    check('the analysis reaches cell 14, where the real gap is',
+          14 in got, f'cells analysed: {sorted(got)[:6]}...')
+
+
 
 
 # --- the replacement machinery ------------------------------------------------------------
@@ -304,6 +475,13 @@ CHECKS = [
     ('guard rails survive python -O', test_guards_survive_python_O),
     ('stale outputs and execution counts are stripped', test_stale_execution_state_is_stripped),
     ('the committed merged notebook is not stale', test_committed_notebook_is_not_stale),
+    ('every loaded name is bound by an earlier cell',
+     test_every_loaded_name_is_bound_by_an_earlier_cell),
+    ('the unbound-name oracle can fail', test_unbound_analysis_detects_a_missing_binding),
+    ('the unbound-name analysis reaches the last cell',
+     test_unbound_analysis_reaches_the_last_cell),
+    ('the unbound-name analysis survives an IPython magic cell',
+     test_unbound_analysis_survives_an_ipython_magic_cell),
 ]
 
 

@@ -109,7 +109,6 @@ check('prior shift factor ~4.2 in odds (train 50/50 under the sampler vs the tes
 # This is the measurement that says how much of the split is explained by the recording alone,
 # which is the question the prior correction was answering indirectly. Falsifiable: the numbers
 # must match an independent recomputation from the split, not merely be printed.
-_tl = nn['_tape_lookup_baseline']
 _rc = nn['_rec_of']
 _by = {}
 for w in nn['train_wavs']:
