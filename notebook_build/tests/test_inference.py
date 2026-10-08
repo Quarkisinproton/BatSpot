@@ -853,7 +853,7 @@ def no_matching_tables_is_reported():
 
 
 check('only the recordings whose file stem a table contains are scored', two_recordings_scored)
-check('the duplicate waveform-view row is ignored, so 2 bat boxes + 1 noise box are counted',
+check('the waveform-view row is ignored, so 3 bat boxes + 1 noise box are counted, not 4+1',
       waveform_view_rows_ignored)
 check("the species of each FOUND box is scored against the operator's label",
       species_of_found_boxes_scored)
