@@ -1444,3 +1444,141 @@ training data -- check it"; the Raven tables keep the best guess.
 * Nothing here ran on Kaggle; the `DataParallel` path is unchanged from the base notebook (ensemble members are
   unwrapped after training).
 * The GUI / CLI load one model: `classifier_250khz.pk` is the best single member, without the 'unknown' answer.
+
+---
+
+## 12. `SPLIT_BY_RECORDING`: per-species recording split — Claude (2026-10-05)
+
+Scope: **only `batspot-train.ipynb`** (Cells 2 and 7 + one intro line). Default behaviour is unchanged
+(`SPLIT_BY_RECORDING = False`, clip-level stratified split, identical to the committed notebook).
+
+### 12.1 Why — a Kaggle run with `SPLIT_BY_RECORDING = True`
+
+Cell 7 printed `train=601, val=249, test=114`, test = alte 77 / noise 22 / sasa 15, and the classifier
+report had zero rows for acsh, heti, rhbe, rhle, rhro. Cause: the old code ran **one**
+`StratifiedGroupKFold(n_splits=7)` over all clips with the recording as group. A recording is
+indivisible and shared between species, there are only 28 of them (5–101 clips), so each fold holds ~4
+recordings and "stratified" is only approximate: the 86-clip rhbe tape (`20260530-192000`) landed in val
+(val = 26 %), the 68-clip heti tape in train, and test got three classes.
+The zero rows are **support 0** (nothing to score), printed as 0.00 because of `zero_division=0`. The header
+`Precision/Recall/F1` in `evaluate_model` average over the classes in `y_true ∪ y_pred` (no `labels=`), so
+absent-but-predicted classes count as 0 and deflate them; `Balanced acc` ignores absent classes. With a
+global grouped split read balanced accuracy only. Which recordings land where depends on the sklearn
+version (the same call on sklearn 1.9.1 puts the rhbe tape in test and the heti tape in val).
+
+### 12.2 What it does now
+
+`RECORDING_SPLIT_SCOPE` (Cell 2, used only when `SPLIT_BY_RECORDING = True`):
+
+* `'per_species'` (default): each species is split **on its own**; its recordings go whole to train / val / test
+  so each part holds ~70 / 15 / 15 % of *that species'* clips (`split_by_recording_per_species`, Cell 7). Up to
+  11 recordings the assignment is found by exhaustive search (the optimum, ties broken by a seeded RNG);
+  beyond that, largest-first greedy. Fixed seed 42, independent of `SEED`.
+  * species with **>= 3 recordings**: whole recordings held out. No recording contributes the same species to
+    train and to val/test.
+  * **2 recordings** (rhbe: 86 + 20 clips): the bigger one trains, the smaller one is split val/test *by clip*
+    (train is recording-disjoint from val/test; val and test share that tape; rhbe ends 86/10/10, not 70/15/15).
+  * **1 recording** (heti): clip-level split (the only option); it leaks and is reported as such.
+  * < 3 clips: all in train, flagged.
+* `'global'`: the old single `StratifiedGroupKFold` (byte-identical split to the committed notebook).
+
+Cell 7 prints a per-species table (clips, recordings, train/val/test counts and %, rule), warns if a class is
+missing from a split, and the leakage check now also reports **same species and same recording as a train
+clip** (the shortcut "recognise the tape, name the species").
+
+### 12.3 Real data (964 clips, 28 recordings)
+
+| species | clips | recs | train / val / test | % train / val / test | rule |
+| :--- | ---: | ---: | :---: | :---: | :--- |
+| acsh | 160 | 7 | 111 / 24 / 25 | 69.4 / 15.0 / 15.6 | whole recordings |
+| alte | 181 | 7 | 125 / 30 / 26 | 69.1 / 16.6 / 14.4 | whole recordings |
+| heti | 68 | 1 | 48 / 10 / 10 | 70.6 / 14.7 / 14.7 | clip-level (leaks) |
+| noise | 186 | 8 | 130 / 27 / 29 | 69.9 / 14.5 / 15.6 | whole recordings |
+| rhbe | 106 | 2 | 86 / 10 / 10 | 81.1 / 9.4 / 9.4 | bigger tape trains, small one val/test |
+| rhle | 78 | 8 | 56 / 11 / 11 | 71.8 / 14.1 / 14.1 | whole recordings |
+| rhro | 93 | 10 | 65 / 14 / 14 | 69.9 / 15.1 / 15.1 | whole recordings |
+| sasa | 92 | 5 | 62 / 15 / 15 | 67.4 / 16.3 / 16.3 | whole recordings |
+
+Total 683 / 141 / 140; all 8 classes in all three parts. Same-species recording leakage: **0 for every species
+except heti (10 val + 10 test clips)**. Clips whose recording is in train through *another* species: 81 of 140
+test clips (a tape holds several species, and each species is split independently); clip-level mode: 145/145.
+
+### 12.4 Limits — read before quoting a number from this mode
+
+* **Tiny, lumpy evaluation sets.** Each species' val/test is 1–2 recordings and 10–30 clips (rhro test: 14
+  clips, rhle: 11, rhbe/heti: 10). One clip is 7–10 points of per-class recall, and *which* recordings are in test
+  matters as much as the model. The exhaustive search only has 2–4 tied optima (mostly a val/test swap), so the
+  seed does not give a different split; a per-species rotation over recordings (k-fold) would, and is the next step
+  if a spread is needed.
+* **heti is still leaky and rhbe val/test come from one tape.** heti has a single recording, so its number is an
+  in-recording number; rhbe's val and test share one tape.
+* **Cross-species tape sharing makes this split ADVERSARIAL for tape-reliant models (measured, §12.5).** A tape
+  is shared by several species and each species is split on its own, so a test clip whose tape is in train
+  (81 of 140) always meets train clips of *another* species there; all 29 test `noise` clips come from tapes whose
+  train clips are calls only. A model that recognises the tape is scored below chance. Read numbers from this
+  mode as a **pessimistic bound**, not an unbiased new-recording estimate.
+* The split is a function of the file list and the recording id; names without a `YYYYMMDD[-_]HHMMSS` stamp make
+  every clip its own recording (Cell 7 warns) and the mode degrades to a clip-level split.
+
+### 12.5 Measurements (2026-10-05, local RTX 4050, single seed)
+
+**Tape-lookup baseline** (no audio, no model: label each test clip like the majority of the *train* clips from the
+same recording; printed by Cell 7 for every split mode):
+
+| split mode | task | test clips whose tape is in train | accuracy | balanced acc |
+| :--- | :--- | :---: | :---: | :---: |
+| clip-level (default) | noise vs call | 145/145 | 0.883 | **0.887** |
+| clip-level (default) | species (chance 1/8) | 145/145 | 0.745 | **0.767** |
+| global recording | — | 0/166 | — | — (tape says nothing) |
+| per-species recording | noise vs call | 81/140 | 0.580 | **0.452** |
+| per-species recording | species | 81/140 | 0.123 | **0.200** (the 10 right = leaked heti) |
+
+Under the default split a lookup of the tape alone already reaches the in-split detector level (§8.6: bal. acc
+0.89–0.92), so a large part of the in-split accuracy can be tape recognition (not proof; the models were not probed).
+Under `per_species` the tape points at the wrong label *by construction*: all 29 test `noise` clips come from
+tapes whose train clips are calls only (29/29), and the species lookup is right only for heti.
+
+**Full notebook, `SPLIT_BY_RECORDING = True`, `per_species`** (Cells 2-19, 403 s, 0 errors; Cell 7 = the version
+before the tape-lookup print was added, which does not touch the split):
+
+| | in-split (§8.6 / §8.9) | per_species |
+| :--- | :---: | :---: |
+| classifier test acc / bal. acc | 0.848-0.876 / 0.859-0.870 | **0.500 / 0.553** |
+| detector m03 / m09 / m11 bal. acc (AUC) | 0.869-0.926 (0.93-0.97) | **0.475 (0.476) / 0.470 (0.504) / 0.452 (0.494)** |
+| official detectors zero-shot, same clips | 0.73-0.80 (0.84-0.88) | 0.749 (0.695) / 0.555 (0.647) / 0.556 (0.608) |
+| cascade: classifier alone / hard gate / soft | 0.848-0.876 | 0.500 / 0.493·0.500·0.457 / 0.514·0.514·0.507 |
+
+Classifier per-class recall (support): acsh 0.80 (25), alte 0.65 (26), heti 1.00 (10, leaked: clip-level), noise
+**0.00** (29), rhbe 1.00 (10), rhle 0.18 (11), rhro 0.79 (14), sasa **0.00** (15). The fine-tuned detectors sit at
+chance (AUC ~0.5) and *below* the official zero-shot ones on this split. That is the signature of a model that
+learned tape cues being tested where the tape points the other way, **plus** whatever real new-recording
+generalisation there is; the two cannot be separated from this split alone.
+
+**Joint tape assignment (feasibility only, not implemented).** Assigning whole tapes shared by all species to
+train/val/test (simulated annealing over the 28 tapes, objective = the six species with >= 3 tapes at 70/15/15)
+gives tape overlap 0 (tape-lookup = no information) but looser balance: acsh 63.8/23.8/12.5, alte 78.5/7.2/14.4,
+rhle 66.7/14.1/19.2, others within 2 points; overall 638/189/137; heti lands 100 % in val and rhbe has no val
+(one tape and two tapes cannot fill three parts).
+
+### 12.6 Which mode to use
+
+| Want | Use |
+| :--- | :--- |
+| a number comparable to §8 (all classes ~15 % in val/test), knowing it is tape-inflated | `SPLIT_BY_RECORDING = False` |
+| a split where every class is in val/test **and** no species shares a tape with itself across parts | `per_species` — pessimistic bound, adversarial for tape-reliant models |
+| a split where no tape is in two parts (neutral for tape cues), classes may be missing / unbalanced | `global`, or a joint assignment (not implemented) |
+
+Next step if an unbiased new-recording estimate is needed: joint tape assignment with a rotation over tapes
+(k-fold), pooling out-of-fold predictions; expect heti / rhbe to be unscorable on a new tape.
+
+### 12.7 Under the default clip-level split the leak is also *temporal* (2026-10-05)
+
+File names carry `START_END` ms inside the recording, so clips of one tape can be compared in time (default split,
+`random_state=42`: 674 / 145 / 145). Of the 145 test clips: **96 lie within 0.5 s of a train clip of the same tape
+(93 of them of the same species)**, median gap to the nearest same-tape train clip 0.3 s (25th percentile 0.1 s), and
+**14 overlap a train clip in time** (shared audio samples; only 1 of the 14 is the same species). Val is the same
+(85 within 0.5 s, 17 overlapping). Over all clips, 77 of 27 457 same-tape pairs overlap in time. So neighbours in one
+call sequence of one tape land on both sides of the split: the leak is the bout / animal / distance, not only the
+background. Windowing does not remove it: the split is made per clip *before* windowing, so a clip's windows never
+cross parts, but windows of neighbouring clips (~0.3 s apart) are near-duplicates, and the ~x56 more training windows
+(§9.6) are therefore not ~x56 independent samples. Only a recording-level split removes this (§12.5, §12.6).
