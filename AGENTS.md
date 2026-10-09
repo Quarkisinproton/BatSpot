@@ -181,6 +181,7 @@ early-stopping fix (§2.12) exists in exactly one of them.**
 
 | Notebook | Early-stop fix | `RUN_CLIP_EXTRACTION` | Augmentation | Notes |
 | :--- | :---: | :---: | :--- | :--- |
+| `batspot-train-combined.ipynb` | **YES** | `False` | noise mixing on | **Newest (2026-10-06, §11).** batspot-train + Space Bunny fixes + classifier ensemble, 'unknown' answer, robust inference, held-out-recording check. Built from cells/ in `/home/gb/batspot_gpu_experiments/combined_2026-10-05/`. |
 | `batspot-train.ipynb` | **YES** | `True` (guarded) | `False` | Single detector (m09) + classifier. The file this session fixed. |
 | `BatSpot_FineTune_Kaggle.ipynb` | no (hardcoded `20`) | `True` (guarded) | `False` | 3-detector loop + cascade |
 | `batspot-train-in-kaggle.ipynb` | no (hardcoded `20`) | `False` | `True` | Reference notebook |
@@ -1317,3 +1318,129 @@ Question: are the official models too small? **No.** Two measurements (local RTX
    would **no longer load in the BatSpot GUI / `predict.py`**; ResNet-34 loads there but costs ~1.8× the
    training time and gives up the official pretrained weights. **Not adopted.** What would move accuracy:
    more recordings of rhle / rhro / acsh / alte, a label review of acsh↔alte, and a recording-grouped score.
+
+---
+
+## 11. Combined notebook `batspot-train-combined.ipynb` — Claude (Opus 5.5, 2026-10-05)
+
+Scope: a NEW notebook combining `batspot-train.ipynb` (working copy of 2026-10-05, incl. the uncommitted
+`RECORDING_SPLIT_SCOPE='per_species'` split that §10 does not describe) with the review fixes of
+`batspot_train(claude_bug_fixes _by__SPACE_BUNNY_MODEL).ipynb` (§9), plus: classifier seed ensemble,
+an "unknown" answer, input-robust inference, and a recording-held-out check. **Neither source notebook was
+modified.** Build sources, tests, experiment harness and logs: `/home/gb/batspot_gpu_experiments/combined_2026-10-05/`
+(`cells/` = exact source of every cell, `build_notebook.py` assembles them).
+
+### 11.1 What was taken from where
+
+| From | Taken | Not taken (why) |
+| :--- | :--- | :--- |
+| `batspot-train.ipynb` | everything (windowing, training loop, seeding, per-species split, cascade, export, inference 21-24) | — |
+| Space Bunny (§9) | cache validated by source size+mtime, atomic writes, failed clips reported not fatal, NaN guard, per-instance mmaps, `num_mels` fallback, class names by output width, `AUC_NO_SIGNAL` flags + reduced-denominator notes, top-k validation mean, grouped retrain (rebuilt on the per-species splitter) | prior-corrected gate (a monotone rescaling: with a tuned threshold it changes nothing, §10.1); A/B + re-split ablation cell (answered offline, §11.3); `inspect.getsource` cache tag (broken under exec, §11.2) |
+
+### 11.2 Bugs found and fixed while combining (each reproduced first)
+
+| Where | Symptom | Root cause | Fix / proof |
+| :--- | :--- | :--- | :--- |
+| Cell 8 clip extraction (both notebooks) | extracts **nothing** from this repo's `Data/selections` | took `'_'.join(name.split('_')[:2])` = `acsh_devon` as the recording stamp, so no audio file matched | faithful port of `export_clips.R` (stamp `\d{8}_\d{6}`, class sub-folders, `>3 ms`, dataset naming); test: 20/20 rows of 2 real tables extracted, names parse back to the tape, samples bit-identical |
+| Cell 6 cache tag (Space Bunny) | under `exec` (run_local / harness) the tag changed whenever an unrelated script changed -> silent full cache rebuilds | `inspect.getsource` on exec'd code falls back to linecache of `__main__` and returns lines of the wrong file | tag = hash of the compiled code **and default arguments** of `load_audio_file` + `clip_to_db_spectrogram`; test: stable across re-exec, changes when `preemphasis` changes (a first version missed default args -- caught by the test) |
+| Cell 22 chunked resampling | for 250 / 500 kHz recordings each 60 s chunk was resampled on a grid shifted by a fraction of a sample vs the whole file: max difference 13-16 % of full scale on white noise (a 2-5 us shift; small effect on dB spectrograms, but not "identical to training" as documented); 384 kHz was unaffected | excerpt start not aligned to the L/M phase grid | start on output index q0 = multiple of L; test: excerpt == whole file exactly (0.0) for 384/250/256/500 kHz |
+| Cell 23 input listing | one corrupt file crashed the whole cell before the per-file `try` | `sf.info` called on every file in the folder summary | listing guarded; corrupt / empty / 5 ms files reported and skipped |
+| Cell 7 | unreadable clip killed a run, or (with Space Bunny's per-dataset drop) desynchronised detector vs classifier test lists | no global pre-check | unusable files dropped once, before the split |
+
+### 11.3 Experiments that set the new defaults (local RTX 4050, notebook's own code via `exp.py`)
+
+All runs exec Cells 2-10 of the combined notebook and use its dataset, training loop and splitter. Splits:
+`insplit` = the default 70/15/15 clip-level split (seed 42); `perspecies` = Cell 7's `split_by_recording_per_species`
+(whole recordings held out per species; heti still clip-split, rhbe's smaller recording split val/test). Seeds vary
+initialisation and sampling only; the test files are identical across seeds. Raw results (incl. test
+probabilities and embeddings): `results/*.npz`; summaries: `variants_analysis.txt`, `openset_*analysis.txt`.
+
+**Background noise mixing** (`noise_mix_prob = 0.5`, SNR 0-20 dB: a random window of a training `noise` clip,
+i.e. another recording's background, added in the power domain before min-max):
+
+| Model, split | baseline bal. acc. | noise mixing | paired delta per seed |
+| :--- | :---: | :---: | :--- |
+| classifier, held-out recordings | 0.552 +- 0.017 | **0.623 +- 0.034** | +0.043, +0.045, +0.126 |
+| classifier, clip-level split | 0.859 +- 0.009 | 0.846 +- 0.012 | -0.010, -0.017, -0.012 |
+| detector m09, held-out recordings | 0.464 +- 0.033 (AUC 0.48) | **0.556 +- 0.036** (AUC 0.55) | +0.102, +0.091, +0.082 |
+| detector m09, clip-level split | 0.908 +- 0.014 (AUC 0.958) | 0.910 +- 0.009 (AUC 0.951) | -0.017, +0.026, -0.004 |
+
+(3 seeds per cell.) Adopted for both models: +0.07 / +0.09 balanced accuracy on recordings the model has not heard,
+for -0.013 (classifier) / nothing (detector) on familiar ones. The classifier gain is mostly sasa (held-out recall
+0.00 -> 0.60).
+**Still unsolved:** the held-out test noise is ONE noise recording (noise has 8 recordings in total); on it the
+detector stays near chance (AUC 0.55, noise recall 0.11 -> 0.32) and the classifier's noise recall is ~0.01 with
+or without mixing. False alarms on a new kind of noise are the weakest point of the whole pipeline; more noise
+recordings, not code, would fix it. Not tested further: other SNR ranges / probabilities.
+
+**Seed ensemble (classifier, 3 seeds, softmax averaged):** clip-level split, balanced accuracy vs the members'
+mean: 0.859 vs 0.859 (no mixing), 0.857 vs 0.846 (noise mixing); held-out recordings 0.546 vs 0.552 / 0.618 vs
+0.623 -- **0 to +1 point in-split, nothing on new recordings**. Kept for stability (it removes most of the 3-5 point seed lottery of a single run) and because
+the members' spread is printed, not for a generalisation gain.
+
+**Old `USE_AUGMENTATION` set (time shift, Gaussian noise, SpecAugment masks), classifier, 3 seeds:** clip-level
+split 0.847 vs 0.859 (-0.012), held-out recordings 0.557 vs 0.552 (+0.005). No benefit -> stays off.
+
+### 11.4 The "unknown" answer (open set) -- what it can and cannot do
+
+Leave-one-species-out: for each of the 7 species, 3 classifiers (seeds 42/43/44) were trained without it on the
+clip-level split; the held-out species' 68-181 clips are then "never seen". The threshold is set exactly as Cell
+13 does (validation clips of the known species, keep `UNKNOWN_KEEP_KNOWN` of the correct answers). Scores compared
+(single model, 7 species): max softmax AUROC 0.70 (rhro 0.46: the model is MORE confident on a species it never
+saw), kNN cosine 0.78-0.80, **Mahalanobis on the 512-d embedding 0.84** (every species >= 0.75). Shipped:
+per-member Mahalanobis averaged over the 3-seed ensemble (AUROC 0.840):
+
+| `UNKNOWN_KEEP_KNOWN` | never-seen species -> 'unknown' | -> 'noise' | -> a wrong name | known species: correct answers lost |
+| :---: | :---: | :---: | :---: | :---: |
+| **0.95 (default)** | 30 % | 18 % | 52 % | 3.6 % (0.864 -> 0.828) |
+| 0.90 | 40 % | 18 % | 43 % | 5.5 % |
+| 0.80 | 52 % | 18 % | 30 % | 8.6 % |
+
+Per species at 0.95: sasa 51 % caught, rhle 36 %, alte 29 %, acsh 28 %, rhro 26 %, rhbe 23 %, heti 19 % (heti and
+acsh also go to noise often). Species that resemble a training species (acsh/alte, rhle/rhro) are the hardest.
+**Read it as a triage flag, not a guarantee**: at the default it labels ~1 in 3 calls of a new species
+'unknown' while costing ~1 in 28 correct answers. The Raven tables keep the classifier's best guess next to it.
+
+### 11.5 Inference: "anything thrown at it"
+
+| Input | Handling | Verified (run B2 / B3, `stress/`) |
+| :--- | :--- | :--- |
+| any sample rate | rational ratio L/M -> resampy's `kaiser_best` taps as L polyphase FIRs, one strided `conv1d` (GPU or CPU), self-checked against resampy per ratio; > 512 phases or a failed check -> resampy | 12 rate pairs x CPU/GPU (`test_resample.py`): <= 6.4e-7 of full scale, except 250->192 and 500->192 kHz at 4-8e-5 -- exactly the ~0.02 % of outputs where resampy's own float64 time grid rounds below an integer and drops a tail tap (it is not chunk-consistent there itself). Chunked scanning == whole file (0.0) for 384/250/256/500 kHz. 250/256/500 kHz files: same selections as the 384 kHz original |
+| time-expanded files | `INFER_TIME_EXPANSION` (true rate = header x factor) | 10x file at a 38.4 kHz header: identical rows and clock times to the original |
+| WAV / FLAC / AIFF / OGG, int / float, stereo | `INFER_EXTENSIONS`; channels averaged as in training | FLAC and float32 copies: identical rows to the WAV |
+| folder, single file, top-level `.zip`; corrupt / empty / 5 ms files | listing guarded; per-file `try`; corrupt files reported and skipped | corrupt -> FAILED, run continues; empty and 5 ms -> no selections |
+| no timestamp in the name | AudioMoth header, else clock from 00:00:00 (reported) | reported per file |
+| ensemble / exported models | `INFER_CLASSIFIER_PK` = list of member `.pk` + `INFER_UNKNOWN_FILE` (refuses a sidecar fitted for other members) | run B1: skip-training path from the exported files == in-memory run A, all 1110 + 183 rows identical |
+| one input folder per night / site | `INFER_PER_FOLDER_FILES` (default on): besides the combined file, `batspot_detections_per_folder/batspot_detections_<folder>.txt`, same columns, Selection 1..n per file | 80-excerpt set: 7 files, counts sum to the combined 1110; byte-identical to `split_per_folder.py` (splits an existing combined file the same way) |
+
+**"unknown" also reacts to the recording chain, not only to new species.** The 256 kHz copy (two anti-alias
+filters, 384->256->250 kHz, where training used one) kept the same best guesses and confidences (rhro 0.94-0.97)
+but 6 of its 8 selections became 'unknown'; the 250 and 500 kHz copies did not. Read 'unknown' as "unlike the
+training data -- check it"; the Raven tables keep the best guess.
+
+### 11.6 Verification of the notebook itself
+
+* **Run A** (`run_local.py`, local RTX 4050, all 23 code cells, 1254 s incl. thermal pauses, 0 errors): detectors
+  m03 / m09 / m11 test balanced 0.891 / 0.899 / 0.891 (m11 = best validation -> inference); classifier members
+  0.837 +- 0.011 accuracy, **ensemble 0.848 accuracy / 0.857 balanced**; "unknown" on 5/145 known test clips
+  (4 would have been correct): 0.848 -> 0.821 counting them as errors; official zero-shot -> fine-tuned balanced
+  accuracy +0.092 / +0.171 / +0.132. Seeded members reproduce the `exp.py` runs to 4 decimals. Held-out check
+  (Cell 26): classifier 0.860 -> 0.596 balanced, detector m11 0.891 -> 0.642.
+* **Inference on the 80 test excerpts** (in-sample: cut from training recordings): 498/509 bat boxes found (0.978;
+  0.967 in section 10), species correct 382/498 = 0.767 counting 'unknown' as wrong, 0.799 on the 478 named boxes
+  (0.787 in section 10, single classifier, no noise mixing); 20 'unknown'; 3/9 noise boxes hit (1/9 before).
+* Unit tests (`test_units.py`, 17 checks) and resampler tests (`test_resample.py`) all pass; each new piece is
+  exercised through the notebook's own cells.
+
+### 11.7 Known limits
+
+* **New kinds of noise are the weak point.** On the one held-out noise recording, detector AUC 0.55 and classifier
+  noise recall ~0.01 even with noise mixing -> expect false alarms on unfamiliar backgrounds. Needs more noise
+  recordings (there are 8).
+* In-split numbers stay an upper bound (28 recordings); the held-out numbers come from ONE per-species split and are
+  noisy (a few recordings per class).
+* Noise mixing costs ~1 point of classifier accuracy on familiar recordings; `CLS_CONFIG['noise_mix_prob'] = 0.0`
+  gives the in-split optimum. The ensemble triples classifier training time (~3 x 3-6 min) and gives no measured gain on new recordings.
+* Nothing here ran on Kaggle; the `DataParallel` path is unchanged from the base notebook (ensemble members are
+  unwrapped after training).
+* The GUI / CLI load one model: `classifier_250khz.pk` is the best single member, without the 'unknown' answer.

@@ -97,33 +97,10 @@ N_BASE_CELLS = 24
 # output width (not by sorted dict value), and the no_signal flag.
 # 17 = summary: the combined notebook's cell 18. kind / n_files columns, NO SIGNAL markers and
 # the reduced-denominator warning.
-# 20 = inference config: the combined notebook's cell 21. The INFER_* block, `_model_from_pk`
-#  accepting a LIST of .pk files as a SoftmaxEnsemble, and the 'unknown' sidecar MEMBERSHIP guard
-#  (a sidecar fitted for other members carries a threshold that means nothing for these models, so
-#  it is refused rather than silently applied). The detector is chosen on the VALIDATION score, a
-#  tie going to m09.
-# 21 = inference functions: the combined notebook's cell 22. THIS IS THE CHUNK-ALIGNMENT FIX. The
-#  base cell 21 started each resampling excerpt at `floor((r0 - margin)*sr_in/sr)`, which for any
-#  rate pair whose M/L is not a whole number (250 / 256 / 500 kHz -> 192 kHz) leaves the excerpt's
-#  output grid a fraction of a sample off the whole recording's, so a scanned chunk stops
-#  reproducing the whole-file resample: measured on white noise against the base cell's own
-#  `_resampled`, 77 % of full scale at 250 kHz, 67 % at 256 kHz, 49 % at 500 kHz. 384 kHz was
-#  immune -- its ratio is exactly 1/2, M/L = 2 input samples per output sample -- which is why
-#  one rate pair alone could never have caught it. The port computes `q0 = ((r0 - margin) // L) * L`,
-#  so the excerpt begins on an input sample lying exactly on the output grid and its output samples
-#  ARE whole-file output samples. Copied verbatim like the rest: the same cell carries the polyphase
-#  resampler with its self-check against resampy, the guarded `_read_mono`, the frequency
-#  measurement and the clock-time helpers.
-# 22 = inference run: the combined notebook's cell 23. `sf.info` is called inside a try/except, so
-#  ONE CORRUPT FILE cannot kill the cell before it has listed anything -- the base cell raised
-#  LibsndfileError straight out of the listing loop. Also writes the per-folder detections files.
-# 23 = inference scoring: the combined notebook's cell 24, optional, against the operator's own
-#  Raven selection tables.
 REPLACE: dict[int, str] = {
     1: 'src_01.py', 4: 'src_04.py', 5: 'src_05.py', 6: 'src_06.py', 7: 'src_07.py',
     8: 'src_08.py', 9: 'src_09.py', 11: 'src_11.py', 12: 'src_12.py', 13: 'src_13.py',
-    14: 'src_14.py', 16: 'src_16.py', 17: 'src_17.py', 20: 'src_20.py', 21: 'src_21.py',
-    22: 'src_22.py', 23: 'src_23.py',
+    14: 'src_14.py', 16: 'src_16.py', 17: 'src_17.py',
 }
 
 # Cells appended after the base cells, markdown first then code.
