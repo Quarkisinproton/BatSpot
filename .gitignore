@@ -42,3 +42,9 @@ batspot-train (out_put).ipynb
 Data for testing/
 Sonnet5.5_implimentation.md
 Space_Bunny_implimentation.md
+notebook_build/cells/src_20.py
+notebook_build/cells/src_21.py
+notebook_build/cells/src_22.py
+notebook_build/cells/src_23.py
+notebook_build/tests/test_inference.py
+thermal_guard.log
